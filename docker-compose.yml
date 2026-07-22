@@ -1,0 +1,68 @@
+version: "3.8"
+
+services:
+  sync-api:
+    build: .
+    container_name: anyshare-sync-api
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Shanghai
+      - ANYSHARE_URL=${ANYSHARE_URL}
+      - ANYSHARE_CLIENT_ID=${ANYSHARE_CLIENT_ID}
+      - ANYSHARE_CLIENT_SECRET=${ANYSHARE_CLIENT_SECRET}
+      - BISHENG_URL=${BISHENG_URL}
+      - BISHENG_COOKIE=${BISHENG_COOKIE}
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - /tmp/anyshare-sync:/tmp/anyshare-sync
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/admin/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  sync-worker:
+    build: .
+    container_name: anyshare-sync-worker
+    command: celery -A app.workers.tasks worker -l info -P threads -c 4 -Q celery
+    environment:
+      - TZ=Asia/Shanghai
+      - ANYSHARE_URL=${ANYSHARE_URL}
+      - ANYSHARE_CLIENT_ID=${ANYSHARE_CLIENT_ID}
+      - ANYSHARE_CLIENT_SECRET=${ANYSHARE_CLIENT_SECRET}
+      - BISHENG_URL=${BISHENG_URL}
+      - BISHENG_COOKIE=${BISHENG_COOKIE}
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - /tmp/anyshare-sync:/tmp/anyshare-sync
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  sync-beat:
+    build: .
+    container_name: anyshare-sync-beat
+    command: celery -A app.workers.tasks beat -l info
+    environment:
+      - TZ=Asia/Shanghai
+      - ANYSHARE_URL=${ANYSHARE_URL}
+      - BISHENG_URL=${BISHENG_URL}
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: anyshare-sync-redis
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

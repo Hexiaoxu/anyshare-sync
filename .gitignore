@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+logs/
+*.log
+.env
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+.DS_Store
+Thumbs.db
+
+# Data/temp files
+console_logs*.json
+acl_*.json
+anyshare_users.json
+_dept_mapping.json
+_tmp_xlsx/
+_xlsx_data.json
+_xlsx_out.txt
+*.xlsx

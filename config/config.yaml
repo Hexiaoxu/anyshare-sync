@@ -1,0 +1,99 @@
+# AnyShare -> BISHENG sync middleware configuration
+
+anyshare:
+  base_url: "https://your-anyshare.example.com"
+  client_id: ""
+  client_secret: ""
+  console_token: ""
+  regular_token: ""              # Browser OAuth token (used for knowledge/department libs)
+  token_url: "/oauth2/token"
+  api_prefix: "/api"
+  console_api_prefix: "/console/api"
+  timeout: 30
+
+bisheng:
+  base_url: "http://your-bisheng.example.com:3001"
+  cookie_name: "access_token_cookie"
+  timeout: 30
+
+database:
+  # dev: sqlite, prod: dameng
+  type: "dameng"
+  sqlite_path: "data/sync_state.db"
+  # dameng config (when type=dameng):
+  host: "127.0.0.1"
+  port: 5236
+  user: "SYSDBA"
+  password: ""
+  schema: ""
+  pool_size: 5
+  pool_timeout: 30
+
+sync:
+  max_depth: 20
+  max_objects_per_scan: 500000
+  scan_timeout_minutes: 60
+  retry_max: 6
+  retry_backoff_seconds: 10
+  missing_threshold: 2
+  archive_days: 30
+  temp_dir: "/tmp/anyshare-sync"
+
+  # == Tree-structured sync ==
+  # Each tree = one BISHENG space, with sub-folders for each item.
+  # Root has no permissions; only sub-folders and files get ACL.
+  trees:
+    - space_name: "知识库"
+      type: "knowledge_doc_lib"
+      no_root_perms: true
+      items:
+        - name: "管理办法"
+          gns: "gns://0CBDB95E9E4340899A39C0D158E5C4F2"
+        - name: "公司资质"
+          gns: "gns://1A71734693F8464A9B8C1980D4AFBB44"
+        - name: "培训资料"
+          gns: "gns://DB436A784907494485D9AC4AAF2AFEFF"
+        - name: "期刊文献"
+          gns: "gns://EA81FBA55D924C4C94270749A3B09FD4"
+        - name: "软件库"
+          gns: "gns://FEC4ECCA25544AC3A17017FB2874E6B6"
+        - name: "典型案例"
+          gns: "gns://1EBBB7C76D8A4CE6B443B3025AFE1D98"
+        - name: "法律法规及标准规范"
+          gns: "gns://009D6DCDE91245289E398130686CC85D"
+        - name: "电子图书"
+          gns: "gns://25BB20A5812142DF85CEC0E40FCDF5D7"
+        - name: "科技档案"
+          gns: "gns://FBC8876DC6AD47E5BBF08C4036B17278"
+        - name: "管理手册"
+          gns: "gns://B773730A8564417CA5A2F312F487E45F"
+        - name: "岗位应知应会"
+          gns: "gns://524F4BE297F548B880148E7E515CB0D7"
+        - name: "岗位举报箱"
+          gns: "gns://51C3005DE720472298C91C048550553F"
+        - name: "待审文件"
+          gns: "gns://63214A0B644F49E982779B5051800C7D"
+
+    - space_name: "部门文档库"
+      type: "department_doc_lib"
+      no_root_perms: true
+      skip_download: true
+      items:
+        - name: "人力资源部"
+          gns: "gns://0C9379F8E48545FEBE837679F3B4D9FA/11C780161B4D4F7BB9E227D6E332E37B/26FBA3F5DCAB467D9BB150C19FAFE75E/CB95075F74E34552B2D9577A338EDF87"
+          ancestors: "组织文档库,中国水利水电第五工程局有限公司,公司总部,人力资源部(党委组织部_干部部)"
+        - name: "财务部"
+          gns: "gns://0C9379F8E48545FEBE837679F3B4D9FA/11C780161B4D4F7BB9E227D6E332E37B/26FBA3F5DCAB467D9BB150C19FAFE75E/0A8EFAD7ADAE4AD5AC4C5B16705C1948"
+          ancestors: "组织文档库,中国水利水电第五工程局有限公司,公司总部,财务部"
+
+scheduler:
+  retry_due_tasks_seconds: 60
+  poll_ingestion_seconds: 45
+  daily_scan_time: "02:30"
+  daily_housekeeping_time: "02:00"
+  weekly_reconcile_day: "monday"
+  weekly_reconcile_time: "03:00"
+
+logging:
+  level: "INFO"
+  format: "[{time:YYYY-MM-DD HH:mm:ss}] [{level}] {name}:{line} - {message}"
