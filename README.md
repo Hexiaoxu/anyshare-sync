@@ -1,385 +1,373 @@
-# AnyShare → BISHENG 文档同步中间件
+# AnyShare → BISHENG 文档同步工具
 
-## 1. 系统概述
+将 AnyShare 的知识库、部门文档库和个人文档库单向迁移到 BISHENG，并同步目录结构与 ACL 权限。项目支持 Docker 部署、首次全量迁移以及基于 AnyShare Console 操作日志的后续增量同步。
 
-将爱数 AnyShare 三种文档库（知识库、部门文档库、个人文档库）单向迁移到 BISHENG 知识空间，**保留完整目录结构和 ACL 权限**。
+> 当前生产镜像：`anyshare-sync:latest`。镜像默认命令是 `python3 daemon.py`，默认工作目录是 `/app`。
 
-### 能力矩阵
+## 1. 当前能力
 
-| | 知识库 | 部门文档库 | 个人文档库 |
-|---|---|---|---|
-| 递归扫描 | ✅ | ✅ | ✅ |
-| 目录创建 | ✅ | ✅ | ✅ |
-| 文件下载+上传 | ✅ | ❌ (需管理Token) | ✅ |
-| 权限采集+翻译 | ✅ | ✅ | ✅ |
-| 逐资源授权 | ✅ | ✅ | ✅ |
-| 用户 Owner 授权 | — | — | ✅ |
-| 全量同步 | ✅ | ✅ | ✅ |
-| 增量同步 (rev对比) | ✅ | ✅ | ✅ |
-| 日志驱动增量 | ✅ | ✅ | ✅ |
-| 守护进程（自动循环） | ✅ | ✅ | ✅ |
-| 批量调度 | ✅ | ✅ | ✅ |
-| 一键命令 | ✅ | ✅ | ✅ |
+| 能力 | 知识库 | 部门文档库 | 个人文档库 |
+|---|---:|---:|---:|
+| 递归扫描目录 | ✅ | ✅ | ✅ |
+| 创建 BISHENG 目录 | ✅ | ✅ | ✅ |
+| 下载并迁移文件 | ✅ | 可选 | ✅ |
+| 同步 ACL | ✅ | ✅ | 仅授予个人 owner |
+| 全量迁移 | ✅ | ✅ | ✅ |
+| 按 `rev` 跳过未变化文件 | ✅ | ✅ | ✅ |
+| Console 日志增量 | ✅ | ✅ | 部分支持 |
 
----
+当前主流水线对可迁移的 AnyShare ACL 统一授予 BISHENG `viewer`：ACL 必须包含 `download`，并且不能包含 `deny`。个人库会额外把对应用户授予空间 `owner`。
 
-## 2. 架构
+## 2. 代码入口
 
-```
-run_sync.py                     ← 统一 CLI 入口
-  ├── --user <name>             ← 个人库一键迁移
-  ├── --batch                   ← 批量（读 config.yaml）
-  ├── --incremental             ← 增量模式
-  ├── --sync-logs               ← Console 日志驱动增量
-  ├── --daemon <ct>             ← 守护进程（每小时自动）
-  └── <gns> <name>              ← 单库全量
-
-app/
-├── sync_pipeline.py            ← 核心管道：扫描→建目录→传输→映射→赋权
-├── batch_orchestrator.py       ← 批量调度器
-├── logger.py                   ← 日志引擎（trace ID + 文件滚动）
-├── connectors/
-│   ├── anyshare/               ← AnyShare API 封装
-│   │   ├── auth.py             ← Token 管理 (client_credentials + user token)
-│   │   ├── scanner.py          ← BFS 目录扫描 + 压缩包过滤
-│   │   ├── downloader.py       ← 文件下载 (osdownload 协议)
-│   │   ├── acl.py              ← ACL 权限采集 (perm2/get)
-│   │   └── console.py          ← Console API (部门树、日志)
-│   └── bisheng/                ← BISHENG API 封装
-│       ├── client.py           ← HTTP 客户端 (Cookie 认证 + 业务错误处理)
-│       ├── space.py            ← 空间 CRUD + 旧空间清理
-│       ├── folder.py           ← 文件夹创建
-│       ├── file_transfer.py    ← 文件上传 (MinIO) + 注册
-│       └── permission.py       ← 权限授权 (OpenFGA ReBAC) + 批量+重试
-├── services/
-│   ├── principal_mapper.py     ← 用户/部门身份映射 (accessorname 解析)
-│   ├── permission_translator.py← ACL → FGA 四级角色翻译
-│   ├── permission_gate.py      ← 权限门禁检查 (deny/过期/外发)
-│   ├── log_event_handler.py    ← Console 日志事件处理器 (8种操作类型)
-│   └── log_scheduler.py        ← 日志驱动增量调度器 (定时循环)
-└── models/
-    └── base.py                 ← 数据库引擎 (SQLite / Dameng 双模式)
+```text
+run.py                      统一命令入口
+daemon.py                   Docker 默认入口，周期拉取 Console 日志
+discover.py                 发现知识库、部门库和个人库
+migrate_all.py              全量迁移所有库（调用专用迁移脚本）
+sync_dept_lib.py            单个知识库/部门库迁移
+sync_one_user.py            单个个人库迁移
+app/sync_pipeline.py        核心同步流水线
+app/tree_orchestrator.py    按 config.yaml 中的 trees 组织空间
+app/services/log_scheduler.py
+                            checkpoint 与日志增量调度
 ```
 
----
+推荐使用以下两条主路径：
 
-## 3. 权限模型
+- 知识库和部门库首次迁移：`python3 run.py --tree`。
+- 后续日志增量：`python3 daemon.py`。
 
-### AnyShare (操作位模型)
+`migrate_all.py`、`sync_dept_lib.py` 和 `sync_one_user.py` 是仍在使用的专用脚本，但部分行为与统一 `SyncPipeline` 不完全相同。
 
-```
-每个文件/文件夹有独立 ACL:
-  accessortype: user | department
-  accessorname: "5jqianw/**eisoo**/钱卫"   ← 用户名/**eisoo**/显示名
-  allow: [display, preview, download, create, modify, delete, cache, internal_sharing]
-  deny:  []                                  ← 有 deny 则跳过
-  endtime: -1                                ← -1=永久, 否则跳过
-  inherit: true                              ← 继承上级（BISHENG 无此概念）
-```
+## 3. 配置
 
-### BISHENG (四级角色模型)
-
-| 角色 | 权限范围 |
-|---|---|
-| viewer | 查看、预览、下载 |
-| editor | viewer + 修改 + 新建 |
-| manager | editor + 删除 + 内部共享 |
-| owner | manager + 管理权限（管理员+创建者） |
-
-### 翻译规则
-
-| AnyShare allow 位组合 | → BISHENG |
-|---|---|
-| 缺 download | ⛔ 跳过 |
-| 有 download | viewer |
-| + modify + create | editor |
-| + delete + internal_sharing | manager |
-
----
-
-## 4. 快速开始
-
-### 4.1 环境
-
-```bash
-pip install httpx sqlmodel pyyaml cryptography pymysql dmPython
-```
-
-### 4.2 配置
-
-编辑 `config/config.yaml`：
+配置文件为 `config/config.yaml`，镜像运行时不会内置该文件，必须挂载到 `/app/config/config.yaml`。
 
 ```yaml
 anyshare:
-  base_url: "https://5j-zsgl.powerchina.cn"
-  client_id: "7b98e7b6-f35e-4613-aeed-5b13112b0ff8"
-  client_secret: "Test123."
+  base_url: "https://your-anyshare-host"
+  timeout: 30
+  client_id: "your-client-id"
+  client_secret: "your-client-secret"
+  admin_account: "admin-account"
+  console_user_id: "console-user-id"
 
 bisheng:
-  base_url: "http://192.168.106.161:3001"
+  base_url: "http://your-bisheng-host:3001"
   timeout: 30
+  jwt_secret: "your-bisheng-jwt-secret"
+  jwt_issuer: "bisheng"
+  jwt_expire_seconds: 86400
+  jwt_admin_user_id: 1
+  jwt_admin_user_name: "admin"
+  jwt_admin_tenant_id: 1
+  jwt_admin_token_version: 1
 
 database:
-  type: "sqlite"            # dev: sqlite | prod: dameng
+  type: "dameng"                # dameng | sqlite
   sqlite_path: "data/sync_state.db"
-  # Dameng 配置 (type: dameng):
-  # host: "192.168.107.9"
-  # port: 5236
-  # user: "SYSDBA"
-  # password: "6o+%s3z2NK7J"
-  # schema: "BISHENG_FOR_AISHU"
+  host: "your-db-host"
+  port: 5236
+  user: "your-db-user"
+  password: "your-db-password"
+  schema: "BISHENG_FOR_AISHU"
 
 sync:
-  max_depth: 20
-  max_objects_per_scan: 500000
-  scopes:
-    - source_gns: "gns://..."
-      space_name: "公司资质"
-      source_type: "knowledge_doc_lib"
-      enabled: true
+  trees:
+    - space_name: "知识库"
+      type: "knowledge_doc_lib"
+      no_root_perms: true
+      items:
+        - name: "公司资质"
+          gns: "gns://YOUR_GNS_ID"
+
+    - space_name: "部门文档库"
+      type: "department_doc_lib"
+      no_root_perms: true
+      skip_download: true
+      items:
+        - name: "财务部"
+          gns: "gns://YOUR_GNS_PATH"
 ```
 
-### 4.3 Dameng 初始化（仅生产环境）
+配置含密码和 JWT 密钥，不要提交真实配置、打印完整配置或将其打入镜像。建议只提交 `config.example.yaml`，生产配置通过只读卷挂载。
+
+### trees 的含义
+
+- 一个 `tree` 对应一个 BISHENG 知识空间。
+- `items` 中的每个 AnyShare 文档库作为该空间下的一棵子目录树。
+- `no_root_perms: true` 表示不迁移文档库根权限，只处理子目录和已迁移文件。
+- `skip_download: true` 表示只创建目录和同步目录权限，不下载文件。
+- `ancestors` 可以用逗号分隔的字符串指定额外的上级目录。
+
+## 4. Docker 镜像
+
+### 4.1 构建和导入
+
+在项目根目录构建：
 
 ```bash
-# 首次部署时建表
-python init_dameng_sql.py
+docker build -t anyshare-sync:latest .
 ```
 
-然后在 `config.yaml` 中设 `database.type: dameng`。
-
-### 4.4 获取 Token
-
-**AnyShare Browser Token**（知识库/部门库用）：
-```javascript
-// F12 Console → AnyShare 页面
-document.cookie.match(/client\.oauth2_token=([^;]+)/)[1]
-```
-
-**AnyShare Console Token**（日志驱动增量 + 守护进程用）：
-```javascript
-// F12 Console → AnyShare 后台管理 /console/
-document.cookie.match(/console\.oauth2_token=([^;]+)/)[1]
-```
-
-**BISHENG Cookie**：
-```javascript
-// F12 Console → BISHENG 页面
-document.cookie.match(/access_token_cookie=([^;]+)/)[1]
-```
-
----
-
-## 5. 命令参考
-
-### 5.1 知识库全量迁移
+从离线包导入：
 
 ```bash
-python run_sync.py "<as_token>" "<bs_cookie>" "<lib_gns>" "<space_name>"
+docker load -i anyshare-sync.tar.gz
 ```
 
-### 5.2 部门文档库（只建目录+赋权）
+验证镜像：
 
 ```bash
-python run_sync.py "<as_token>" "<bs_cookie>" "<lib_gns>" "<space_name>" \
-    --type department_doc_lib \
-    --ancestors "父目录1,父目录2" \
-    --skip-download
+docker image inspect anyshare-sync:latest \
+  --format 'image={{.Id}} created={{.Created}} cmd={{json .Config.Cmd}}'
 ```
 
-### 5.3 个人库一键迁移 ⭐
+当前 Dockerfile 基于 Python 3.11，并包含 Linux amd64 版达梦驱动，因此该镜像应运行在 `linux/amd64` 环境。若目标服务器是 ARM64，需要准备对应架构的达梦驱动并重新构建镜像。
+
+### 4.2 目录挂载
+
+| 宿主机目录 | 容器目录 | 用途 |
+|---|---|---|
+| `./config` | `/app/config` | 配置，Compose 中只读 |
+| `./data` | `/app/data` | checkpoint、SQLite、发现结果 |
+| `./logs` | `/app/logs` | 守护进程日志 |
+| `/tmp/anyshare-sync` | `/tmp/anyshare-sync` | 临时目录 |
+
+启动前创建持久化目录：
 
 ```bash
-# 自动获取 Token + 查找 GNS + 迁移 + grant owner
-python run_sync.py "<bs_cookie>" --user 5jzhoujiajun
-
-# 手动提供 Token（用户名匹配不上时）
-python run_sync.py "<bs_cookie>" --user 程博 --token "ory_at_..."
-
-# 手动指定 owner
-python run_sync.py "<as_token>" "<bs_cookie>" "<gns>" "<name>" \
-    --type user_doc_lib --grant-owner "程博"
+mkdir -p data logs /tmp/anyshare-sync
 ```
 
-### 5.4 增量同步（rev 对比）
+## 5. 首次部署流程
+
+首次部署必须先完成组织和全量数据准备，再启动增量 daemon。
+
+### 5.1 检查配置和连通性
+
+确认以下服务可从容器访问：
+
+- AnyShare API。
+- BISHENG API。
+- 达梦数据库（使用 `database.type: dameng` 时）。
+- AnyShare 管理员账号具有扫描、下载、ACL 和 Console 日志权限。
+- BISHENG 已配置创建知识空间所需的模型。
+
+如果使用达梦，表结构必须提前由部署方初始化。当前镜像不包含 README 旧版本提到的 `init_dameng_sql.py`，不能通过该命令建表。
+
+### 5.2 发现文档库
+
+先只读预览，不修改配置：
 
 ```bash
-python run_sync.py "<as_token>" "<bs_cookie>" "<lib_gns>" "<space_name>" --incremental
+docker compose --profile job run --rm sync-job \
+  python3 discover.py --dry-run
 ```
 
-### 5.5 日志驱动增量
+`discover.py` 非 dry-run 模式会重写 `config/config.yaml` 的 `sync.trees`，但 Compose 将配置目录挂载为只读，因此不能直接通过上述服务写回配置。需要写回时，可在备份配置后临时使用可写挂载：
 
 ```bash
-python run_sync.py "<as_token>" "<bs_cookie>" "<lib_gns>" "<space_name>" \
-    --sync-logs "<console_token>" 1784476800000000 1784591999999000
+docker run --rm \
+  -v "$(pwd)/config:/app/config" \
+  -v "$(pwd)/data:/app/data" \
+  anyshare-sync:latest python3 discover.py
 ```
 
-### 5.6 守护进程（每小时自动增量）⭐
+该命令会把知识库和部门库写入 `config.yaml`，把个人库写入 `data/personal_libs.json`。
+
+### 5.3 组织导入
+
+从 Excel 导入部门和用户时，需要额外挂载 Excel 文件：
 
 ```bash
-python run_sync.py "<as_token>" "<bs_cookie>" "<lib_gns>" "<space_name>" \
-    --daemon "<console_token>" --interval 3600
+docker run --rm \
+  -v "$(pwd)/config:/app/config:ro" \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/users.xlsx:/input/users.xlsx:ro" \
+  anyshare-sync:latest \
+  python3 run.py --import-org /input/users.xlsx
 ```
 
-首次运行先做一次全量同步建立 UUID→GNS 映射，之后每小时拉 Console 日志增量同步。Ctrl+C 退出。
+注意：当前导入逻辑将 `users_import.json` 写到容器 `/app`，容器删除后文件不会保留。如果后续要批量迁移个人库，应单独持久化或导出该文件。
 
-### 5.7 批量调度
+### 5.4 首次全量迁移
+
+按 `config.yaml` 中的 `sync.trees` 迁移知识库和部门库：
 
 ```bash
-python run_sync.py "<as_token>" "<bs_cookie>" --batch
-python run_sync.py "<as_token>" "<bs_cookie>" --batch --incremental
+docker compose --profile job run --rm sync-job \
+  python3 run.py --tree
 ```
 
-### 5.8 查看有哪些库
+当前配置中部门库设置了 `skip_download: true`，所以部门库只迁移目录和权限。需要迁移文件时，确认管理员 Token 有下载权限后，将该值改为 `false`。
+
+全量模式会删除 BISHENG 中同名的旧空间并重新创建。生产执行前应确认空间名称和影响范围。
+
+### 5.5 启动增量守护进程
 
 ```bash
-python run_sync.py "<as_token>" "<bs_cookie>" --list knowledge
-python run_sync.py "<as_token>" "<bs_cookie>" --list department
-python run_sync.py "<as_token>" "<bs_cookie>" --list personal
+docker compose up -d sync-daemon
+docker compose ps
+docker compose logs -f --tail=200 sync-daemon
 ```
 
----
+停止：
 
-## 6. 工具脚本
+```bash
+docker compose down
+```
 
-| 脚本 | 用途 |
+仅执行一轮增量检查：
+
+```bash
+docker compose --profile job run --rm sync-job \
+  python3 daemon.py --once
+```
+
+第一次运行且不存在 `data/log_sync_checkpoint.json` 时，daemon 只把 checkpoint 初始化为当前时间，不会补拉历史日志。因此顺序必须是：先全量迁移，再立即启动 daemon。
+
+## 6. 常用命令
+
+### 单个文档库
+
+```bash
+docker compose --profile job run --rm sync-job \
+  python3 run.py "gns://SOURCE_ID" "目标空间名"
+```
+
+按数据库中的 `source_rev` 跳过未变化文件：
+
+```bash
+docker compose --profile job run --rm sync-job \
+  python3 run.py "gns://SOURCE_ID" "目标空间名" --incremental
+```
+
+### 单个部门库
+
+默认只同步目录和权限：
+
+```bash
+docker compose --profile job run --rm sync-job \
+  python3 run.py --sync-dept "财务部" "gns://SOURCE_ID"
+```
+
+同时迁移文件：
+
+```bash
+docker compose --profile job run --rm sync-job \
+  python3 run.py --sync-dept "财务部" "gns://SOURCE_ID" --with-files
+```
+
+### 单个个人库
+
+```bash
+docker compose --profile job run --rm sync-job \
+  python3 run.py --user USER_ACCOUNT
+```
+
+程序会自动获取用户 Token、查找个人库 GNS、创建空间并授予该用户 `owner`。
+
+### 查看 AnyShare 文档库
+
+```bash
+docker compose --profile job run --rm sync-job python3 run.py --list knowledge
+docker compose --profile job run --rm sync-job python3 run.py --list department
+docker compose --profile job run --rm sync-job python3 run.py --list personal
+```
+
+### 全库专用脚本
+
+```bash
+docker compose --profile job run --rm sync-job python3 migrate_all.py
+docker compose --profile job run --rm sync-job python3 migrate_all.py --knowledge
+docker compose --profile job run --rm sync-job python3 migrate_all.py --dept
+docker compose --profile job run --rm sync-job python3 migrate_all.py --personal
+docker compose --profile job run --rm sync-job python3 migrate_all.py --with-files
+```
+
+迁移个人库前需要准备 `data/personal_libs.json`；如需显示名到账号的精确映射，还需要让容器内可以读取 `/app/users_import.json`。
+
+## 7. 全量同步流水线
+
+单个文档库由 `SyncPipeline.run()` 按以下顺序处理：
+
+1. 全量模式删除同名空间并新建；增量模式复用同名空间。
+2. 创建配置指定的上级目录。
+3. BFS 扫描 AnyShare 目录和文件，跳过常见压缩包。
+4. 按父子关系创建 BISHENG 文件夹。
+5. 从 AnyShare 下载文件，上传到 BISHENG MinIO 并注册知识文件。
+6. 在数据库中写入扫描批次、空间映射、文件版本和审计记录。
+7. 获取每个资源的 AnyShare ACL，映射 BISHENG 用户/部门并授权。
+8. 写入权限快照并输出本次汇总。
+
+单文件失败会记录警告并继续处理其他文件；整库发生未捕获异常时，返回 `error` 并写错误日志。
+
+## 8. 日志增量流程
+
+`daemon.py` 周期执行：
+
+1. 从 `data/log_sync_checkpoint.json` 读取上次成功处理到的微秒时间戳。
+2. 刷新 AnyShare 管理员 Token。
+3. 拉取 Console 中组织类和文档类操作日志。
+4. 根据事件类型创建、更新或删除文件/目录，刷新 ACL，或同步组织变化。
+5. 处理完成后把当前时间写回 checkpoint。
+6. 等待下一轮，默认间隔 3600 秒。
+
+可通过命令行覆盖间隔：
+
+```bash
+docker compose --profile job run --rm sync-job \
+  python3 daemon.py --interval 1800
+```
+
+## 9. 数据和日志
+
+主要状态包括：
+
+| 状态 | 位置 |
 |---|---|
-| `run_sync.py` | **主入口** — 三库统一命令（8 种模式） |
-| `init_dameng_sql.py` | **Dameng 建表**（生产 deployment） |
-| `scan_tree.py` | 扫描文档库树，打印结构 + ACL 统计 |
-| `list_personal_libs.py` | 列出所有个人文档库及用户名 |
-| `check_personal_libs.py` | 扫描所有个人库，找有内容的 |
-| `search_user_lib.py` | 按用户名/显示名搜索个人库 GNS |
-| `find_my_lib.py` | 获取用户Token + 查找其个人库内容 |
-| `migrate_users.py` | 批量生成用户迁移命令 |
-| `pull_logs.py` | 拉取 Console EACPLog 操作日志 |
-| `test_app_token.py` | 测试 client_credentials Token 权限范围 |
-| `test_personal_token.py` | 测试个人库 Token 获取和访问 |
-| `test_dameng_crud.py` | Dameng CRUD 验证测试 |
-| `test_untested.py` | 增量/批量/日志驱动集成测试 |
-| `dm_schema.py` | 查看 Dameng 数据库结构 |
-| `show_dameng.py` | 查看 Dameng 表和行数 |
+| 增量时间点 | `data/log_sync_checkpoint.json` |
+| 个人库发现结果 | `data/personal_libs.json` |
+| SQLite 状态库 | `data/sync_state.db` |
+| daemon 日志 | `logs/daemon.log` |
+| 同步日志 | `logs/sync.log`、`logs/error.log` |
+| 达梦映射数据 | 配置指定的达梦 schema |
 
----
-
-## 7. 数据库
-
-### 7.1 双模式
-
-| 模式 | 引擎 | 用途 |
-|---|---|---|
-| `sqlite` | SQLModel ORM | 本地开发 |
-| `dameng` | dmPython 直连 | 生产环境 |
-
-切换方式：修改 `config.yaml` 中 `database.type`。
-
-### 7.2 映射表
-
-| 表 | 内容 | 增量依赖 |
-|---|---|---|
-| `anyshare_sync_scope_config` | 同步范围配置 | — |
-| `anyshare_sync_scan_run` | 每次扫描批次 | — |
-| `anyshare_sync_space_mapping` | 文档库 GNS → BISHENG 空间 ID | — |
-| `anyshare_sync_document_mapping` | 文件 GNS/rev/BISHENG ID/状态 | ✅ rev 对比 |
-| `anyshare_sync_permission_snapshot` | ACL → FGA grants 快照 | ✅ 审计追溯 |
-| `anyshare_sync_audit_event` | 操作审计日志 | — |
-| `anyshare_sync_principal_mapping` | 用户/部门身份映射 | — |
-| `anyshare_sync_folder_mapping` | 文件夹映射（预留） | — |
-| `anyshare_sync_task` | 任务队列（预留） | — |
-
-### 7.3 Dameng 建表
+排查命令：
 
 ```bash
-python init_dameng_sql.py
+docker compose ps
+docker compose logs --tail=300 sync-daemon
+docker inspect anyshare-sync-daemon
 ```
 
----
+## 10. 当前已知限制
 
-## 8. 日志驱动增量
+- 当前镜像为 `linux/amd64`，其中的达梦驱动不能直接用于 ARM64。
+- 部门库没有可用下载权限时，只能设置 `skip_download: true`。
+- `SyncPipeline._scan()` 当前实际限制为深度 6、目录 500、文件 2000；`config.yaml` 中的 `max_depth` 和 `max_objects_per_scan` 尚未接入该路径。
+- daemon 新建进程后不会从数据库完整恢复 UUID、目录和文件的内存映射，部分更新、删除或 ACL 事件可能因找不到映射而跳过。
+- `PermissionGate` 尚未接入主流水线；当前行为是上传资源后逐条跳过无法安全转换的 ACL。
+- 权限翻译当前统一为 `viewer`，尚未按 AnyShare 的修改、删除等操作位映射成 `editor` 或 `manager`。
+- `scheduler.daily_scan_time`、`daily_housekeeping_time` 等配置尚未接入当前 daemon；实际使用 `scheduler.interval_seconds`，缺省为 3600 秒。
+- `docker-compose.yml` 中的顶层 `version` 字段对新版 Docker Compose 已过时，会产生警告，但不影响解析和运行。
+- 测试套件当前缺少 `app.connectors.anyshare.mock`，执行 `pytest` 会在收集 `tests/unit/test_auth.py` 时失败。
 
-### 8.1 事件类型
-
-Console API `EACPLog/GetPageLog` 返回的操作事件：
-
-| logType | opType | 含义 | BISHENG 动作 |
-|---------|--------|------|-------------|
-| 12 | 2 | 上传文件 | 下载→上传→注册→赋权 |
-| 12 | 11 | 权限变更 | perm2/get → authorize |
-| 12 | 19 | 文件修改 | 重新下载 |
-| 12 | 22 | 新建文件夹 | 创建目录+赋权 |
-| 12 | 3 | 删除文件 | 标记 status=deleted |
-| 12 | 24 | 自动删除 | 标记 status=deleted |
-| 11 | 1 | 新建部门 | 创建部门 |
-| 11 | 3 | 新建/修改用户 | 同步用户 |
-| 11 | 6 | 移动用户 | 更新用户-部门关系 |
-| 11 | 7 | 移除用户 | 更新用户-部门关系 |
-
-### 8.2 守护进程
+## 11. 更新镜像
 
 ```bash
-python run_sync.py "AS_Token" "BS_Cookie" "gns://..." "公司资质" \
-    --daemon "Console_Token" --interval 3600
+docker compose down
+docker build --no-cache -t anyshare-sync:latest .
+docker compose up -d sync-daemon
+docker compose logs -f --tail=200 sync-daemon
 ```
 
-流程：首次全量同步建 UUID→GNS 映射 → 每小时拉日志 → `LogEventHandler` 分发 8 种 handler → 增量同步 → 更新 checkpoint。
-
-Checkpoint 文件：`data/log_sync_checkpoint.json`
-
----
-
-## 9. 日志系统
-
-### 9.1 输出
-
-| 目标 | 级别 | 路径 |
-|---|---|---|
-| 控制台 | INFO | stdout |
-| 全量日志 | DEBUG | `logs/sync.log` (10MB×5) |
-| 错误日志 | ERROR | `logs/error.log` (5MB×3) |
-
-### 9.2 格式
-
-```
-# 控制台
-[2026-07-21 10:30:15] [INFO   ] Sync start: 公司资质 full
-
-# 文件（含 trace ID）
-[2026-07-21 10:30:15] [DEBUG  ] [a1b2c3d4e5f6] sync_pipeline:89 - Scanned 5 dirs, 9 files
-```
-
-每次同步自动生成 12 位 trace ID，贯穿所有日志，方便排查。
-
----
-
-## 10. 已知限制
-
-| 限制 | 说明 |
-|---|---|
-| 部门库文件下载 | Browser Token 返回 404/403，需要管理Token |
-| 个人库跨用户批量 | 需每个用户设置密码 + `authentication/v1/access_token` |
-| Token 有效期 | AnyShare ~1h，BISHENG ~24h，需手动刷新（守护进程需定期更新） |
-| 部门 include_children | MySQL "Too many connections"，已默认关闭 |
-| 个人库空库率 | 8902 用户中绝大部分为空 |
-| 扫描深度限制 | 默认 6 层、500 目录、2000 文件 |
-
----
-
-## 11. 部署
+离线交付：
 
 ```bash
-# 1. 安装依赖
-pip install httpx sqlmodel pyyaml cryptography pymysql dmPython
-
-# 2. 修改配置
-vim config/config.yaml  # 填入 client_id/secret, BISHENG 地址, 数据库
-
-# 3. 初始化数据库（仅 Dameng 生产）
-python init_dameng_sql.py
-
-# 4. 首次批量全量同步
-python run_sync.py "<as_token>" "<bs_cookie>" --batch
-
-# 5. 启动守护进程（可选）
-python run_sync.py "<as_token>" "<bs_cookie>" "<gns>" "<space>" \
-    --daemon "<console_token>" --interval 3600
+docker save -o anyshare-sync.tar.gz anyshare-sync:latest
 ```
+
+更新镜像不会替代持久化目录中的配置、checkpoint 和日志。升级前仍建议备份 `config/`、`data/` 以及达梦同步表。
