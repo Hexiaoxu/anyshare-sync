@@ -126,25 +126,13 @@ class PermissionTranslator:
         return result
 
     def _determine_relation(self, allowed: set[str]) -> str | None:
-        """Determine the strongest BISHENG relation from allowed actions.
+        """Return 'viewer' if download is present, else None.
 
-        Returns None if the minimum viewer requirement (download) is not met.
+        Any ACL entry that includes download is granted viewer in BISHENG.
         """
         if "download" not in allowed:
-            return None  # cannot safely grant even viewer
-
-        # Start from highest and work down
-        if _REQUIREMENTS["manager"].issubset(allowed):
-            return "manager"
-        if "owner" in allowed or "delete" in allowed and "internal_sharing" in allowed:
-            if _REQUIREMENTS["manager"].issubset(allowed):
-                return "manager"
-        if _REQUIREMENTS["editor"].issubset(allowed):
-            return "editor"
-        if _REQUIREMENTS["viewer"].issubset(allowed):
-            return "viewer"
-
-        return "viewer"  # safe fallback: has download + at least display/preview
+            return None
+        return "viewer"
 
     def _resolve_subject(self, entry: AclEntry) -> int | None:
         """Resolve ACL accessor to BISHENG ID via mapper."""

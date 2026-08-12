@@ -1,0 +1,98 @@
+# ═══════════════════════════════════════════════════════════════
+# AnyShare → BISHENG Sync Middleware — 配置文件示例
+# 复制此文件为 config.yaml 并填入真实值
+# ═══════════════════════════════════════════════════════════════
+
+# ── AnyShare 连接 ──────────────────────────────────────────────
+anyshare:
+  base_url: "https://your-anyshare-host"
+  timeout: 30
+
+  # OAuth2 应用凭证（用于程序化获取Token）
+  client_id: "your-client-id"
+  client_secret: "your-client-secret"
+
+  # 管理员账号（用于自动获取Token，需有scan/download/ACL权限）
+  admin_account: "admin-username"
+
+  # Console 管理员用户ID（用于拉取操作日志，从AnyShare管理后台用户管理中获取）
+  console_user_id: "your-console-user-id"
+
+# ── BISHENG 连接 ───────────────────────────────────────────────
+bisheng:
+  base_url: "http://your-bisheng-host:3001"
+  timeout: 30
+
+  # JWT签名密钥（用于程序化生成Token，无需浏览器）
+  jwt_secret: "your-jwt-secret"
+  jwt_issuer: "bisheng"
+  jwt_expire_seconds: 86400
+  jwt_admin_user_id: 1
+  jwt_admin_user_name: "admin"
+  jwt_admin_tenant_id: 1
+  jwt_admin_token_version: 1
+
+# ── 数据库 ─────────────────────────────────────────────────────
+database:
+  type: "dameng"                      # sqlite | dameng
+  sqlite_path: "data/sync_state.db"
+  # Dameng 配置 (type: dameng)
+  host: "your-db-host"
+  port: 5236
+  user: "SYSDBA"
+  password: "your-db-password"
+  schema: "BISHENG_FOR_AISHU"
+  pool_size: 5
+  pool_timeout: 30
+
+# ── 同步配置 ───────────────────────────────────────────────────
+sync:
+  max_depth: 20
+  max_objects_per_scan: 500000
+  scan_timeout_minutes: 60
+  retry_max: 6
+  retry_backoff_seconds: 10
+  missing_threshold: 2
+  archive_days: 30
+  temp_dir: "/tmp/anyshare-sync"
+
+  # ── 树形同步 ───────────────────────────────────────────────
+  # 每个 tree = 一个 BISHENG 空间，子项作为文件夹
+  # 根目录无权限，子目录和文件有权限
+  trees:
+    - space_name: "知识库"
+      type: "knowledge_doc_lib"
+      no_root_perms: true
+      items:
+        - name: "示例文件夹"
+          gns: "gns://YOUR_GNS_ID"
+
+    - space_name: "部门文档库"
+      type: "department_doc_lib"
+      no_root_perms: true
+      skip_download: true
+      items:
+        - name: "示例部门"
+          gns: "gns://YOUR_GNS_PATH"
+          ancestors: "组织文档库,公司名称,部门名称"
+
+  # 部门文档库迁移模式:
+  #   "single"  — 整个组织文档库作为一个知识空间
+  #   "per_dept" — 每个部门单独一个知识空间
+  dept_lib_mode: "single"
+
+# ── 组织架构导入 ───────────────────────────────────────────────
+# AnyShare 导出的用户 Excel 文件路径
+# 留空时 --import-org 命令会自动发现工程目录下最新的 .xlsx 文件
+org_excel_path: ""
+
+# ── 调度器 ─────────────────────────────────────────────────────
+scheduler:
+  retry_due_tasks_seconds: 60
+  poll_ingestion_seconds: 45
+  daily_scan_time: "02:30"
+  daily_housekeeping_time: "02:00"
+
+# ── 日志 ───────────────────────────────────────────────────────
+logging:
+  level: "INFO"

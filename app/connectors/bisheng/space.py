@@ -20,7 +20,7 @@ class BishengSpace:
         resp = self._c._post("/api/v1/knowledge/space", {
             "name": name,
             "description": description,
-            "auth_type": "public",   # visible only to creator via member mgmt
+            "auth_type": "public",
         })
         data = self._c.ok(resp)
         return self._c.extract_id(data)

@@ -60,13 +60,17 @@ class TransferCoordinator:
             _get_token = self._as_auth.get_app_token
             _get_user = self._as_auth.get_user_token
 
+        admin_account = getattr(config.anyshare, "admin_account", None)
+        _get_acl_token = (lambda *a: token) if token else (
+            (lambda: self._as_auth.get_user_token(admin_account)) if admin_account else _get_token
+        )
         self._downloader = AnyShareDownloader(
             base_url=config.anyshare.base_url,
             get_user_token=_get_user,
         )
         self._acl = AnyShareAcl(
             base_url=config.anyshare.base_url,
-            get_app_token=_get_token,
+            get_token=_get_acl_token,
         )
 
         # BISHENG clients

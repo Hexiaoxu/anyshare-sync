@@ -1,68 +1,32 @@
 version: "3.8"
 
 services:
-  sync-api:
-    build: .
-    container_name: anyshare-sync-api
-    ports:
-      - "8000:8000"
+  # 增量同步守护进程（常驻）
+  sync-daemon:
+    image: anyshare-sync:latest
+    container_name: anyshare-sync-daemon
+    restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-      - ANYSHARE_URL=${ANYSHARE_URL}
-      - ANYSHARE_CLIENT_ID=${ANYSHARE_CLIENT_ID}
-      - ANYSHARE_CLIENT_SECRET=${ANYSHARE_CLIENT_SECRET}
-      - BISHENG_URL=${BISHENG_URL}
-      - BISHENG_COOKIE=${BISHENG_COOKIE}
+    volumes:
+      - ./config:/app/config:ro        # 配置文件（只读）
+      - ./data:/app/data               # checkpoint 和数据库状态
+      - ./logs:/app/logs               # 日志
+      - /tmp/anyshare-sync:/tmp/anyshare-sync  # 临时文件
+    command: python3 daemon.py
+
+  # 全量迁移（按需执行，用完自动退出）
+  # 示例：docker compose run --rm sync-job python3 import_org.py
+  sync-job:
+    image: anyshare-sync:latest
+    container_name: anyshare-sync-job
+    profiles: ["job"]                  # 不随 up 自动启动
+    environment:
+      - TZ=Asia/Shanghai
+      - DEPT_NAME=${DEPT_NAME:-}
+      - DEPT_GNS=${DEPT_GNS:-}
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data
+      - ./logs:/app/logs
       - /tmp/anyshare-sync:/tmp/anyshare-sync
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/admin/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  sync-worker:
-    build: .
-    container_name: anyshare-sync-worker
-    command: celery -A app.workers.tasks worker -l info -P threads -c 4 -Q celery
-    environment:
-      - TZ=Asia/Shanghai
-      - ANYSHARE_URL=${ANYSHARE_URL}
-      - ANYSHARE_CLIENT_ID=${ANYSHARE_CLIENT_ID}
-      - ANYSHARE_CLIENT_SECRET=${ANYSHARE_CLIENT_SECRET}
-      - BISHENG_URL=${BISHENG_URL}
-      - BISHENG_COOKIE=${BISHENG_COOKIE}
-    volumes:
-      - ./config:/app/config:ro
-      - ./data:/app/data
-      - /tmp/anyshare-sync:/tmp/anyshare-sync
-    depends_on:
-      - redis
-    restart: unless-stopped
-
-  sync-beat:
-    build: .
-    container_name: anyshare-sync-beat
-    command: celery -A app.workers.tasks beat -l info
-    environment:
-      - TZ=Asia/Shanghai
-      - ANYSHARE_URL=${ANYSHARE_URL}
-      - BISHENG_URL=${BISHENG_URL}
-    volumes:
-      - ./config:/app/config:ro
-    depends_on:
-      - redis
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    container_name: anyshare-sync-redis
-    volumes:
-      - redis-data:/data
-    restart: unless-stopped
-
-volumes:
-  redis-data:

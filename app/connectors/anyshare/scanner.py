@@ -126,17 +126,26 @@ class AnyShareScanner:
 
     def _fetch_page(self, gns_path: str, marker: str | None = None) -> dict | None:
         """Fetch one page of sub_objects."""
+        import time as _t
         encoded = quote(gns_path, safe="")
         url = f"{self._url}/api/efast/v1/folders/{encoded}/sub_objects"
         params = {"limit": 100, "sort": "name", "direction": "asc"}
         if marker:
             params["marker"] = marker
 
-        with httpx.Client(timeout=httpx.Timeout(self._timeout)) as client:
-            resp = client.get(
-                url,
-                params=params,
-                headers={"Authorization": f"Bearer {self._get_token()}"},
-            )
+        for attempt in range(3):
+            with httpx.Client(timeout=httpx.Timeout(self._timeout)) as client:
+                resp = client.get(
+                    url,
+                    params=params,
+                    headers={"Authorization": f"Bearer {self._get_token()}"},
+                )
+            if resp.status_code in (429, 502, 503):
+                wait = 10 * (attempt + 1)
+                logger.debug(f"HTTP {resp.status_code} on {url[-40:]}, retry in {wait}s")
+                _t.sleep(wait)
+                continue
             resp.raise_for_status()
             return resp.json()
+        resp.raise_for_status()  # raise after exhausting retries
+        return None

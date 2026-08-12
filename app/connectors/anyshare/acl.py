@@ -28,9 +28,9 @@ class AclEntry:
 class AnyShareAcl:
     """Collects ACL and owner info from AnyShare."""
 
-    def __init__(self, base_url: str, get_app_token, timeout: float = 30.0):
+    def __init__(self, base_url: str, get_token, timeout: float = 30.0):
         self._url = base_url.rstrip("/")
-        self._get_token = get_app_token
+        self._get_token = get_token
         self._timeout = timeout
 
     def get_acl(self, object_id: str) -> list[AclEntry]:

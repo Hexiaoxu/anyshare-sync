@@ -51,11 +51,12 @@ class SyncPipeline:
 
     def __init__(self, bs_base: str, bs_cookie: str,
                  as_base: str, as_token: str,
-                 as_auth=None):
+                 as_auth=None, as_account: str = None):
         # Tokens — auth object for auto-refresh, raw token as fallback
         self._as_token = as_token
         self._as_base = as_base.rstrip("/")
         self._as_auth = as_auth  # AnyShareAuth instance (optional)
+        self._as_account = as_account  # username for auto token (e.g. "5j_lim")
 
         # BISHENG clients
         self._bs = BishengClient(bs_base, bs_cookie, timeout=60)
@@ -64,17 +65,31 @@ class SyncPipeline:
         self._bs_file = BishengFileTransfer(self._bs)
         self._bs_perm = BishengPermission(self._bs)
         self._mapper = PrincipalMapper()
+        self._init_state()
 
     def _get_as_token(self) -> str:
-        """Get AnyShare token. App Token can't scan — always use the original token."""
+        """Get AnyShare token — auto-refresh via user account if available."""
+        if self._as_auth and self._as_account:
+            try:
+                return self._as_auth.get_user_token(self._as_account)
+            except Exception:
+                pass
         return self._as_token
 
-        # State
-        self._space_id: int | None = None
-        self._folder_map: dict[str, int] = {}
-        self._file_map: dict[str, int] = {}
-        self._uuid_to_gns: dict[str, str] = {}  # objId UUID -> full GNS
-        self._gns_to_name: dict[str, str] = {}  # GNS -> file/folder name
+    # State — initialized here so incremental sync works without run()
+    def _init_state(self):
+        if not hasattr(self, '_space_id'):
+            self._space_id: int | None = None
+        if not hasattr(self, '_folder_map'):
+            self._folder_map: dict[str, int] = {}
+        if not hasattr(self, '_file_map'):
+            self._file_map: dict[str, int] = {}
+        if not hasattr(self, '_uuid_to_gns'):
+            self._uuid_to_gns: dict[str, str] = {}
+        if not hasattr(self, '_gns_to_name'):
+            self._gns_to_name: dict[str, str] = {}
+        if not hasattr(self, '_bs_folder_by_path'):
+            self._bs_folder_by_path: dict[str, int] = {}
 
     # ── Main entry ──────────────────────────────────────────
 
@@ -208,6 +223,8 @@ class SyncPipeline:
 
     def resolve_uuid(self, obj_id: str) -> str | None:
         """Resolve objId UUID to full GNS path."""
+        if not hasattr(self, '_uuid_to_gns'):
+            self._uuid_to_gns = {}
         return self._uuid_to_gns.get(obj_id)
 
     def sync_from_logs(self, console_token: str, since_date: int,
@@ -299,18 +316,16 @@ class SyncPipeline:
                 "total_changes": len(changed_uuids)}
 
     def _build_grants(self, perminfos: list) -> list[dict]:
-        """Build BISHENG grants from AnyShare perm2/get response."""
+        """Build BISHENG grants from AnyShare perm2/get response.
+
+        Rule: any ACL entry with 'download' in allow (and no deny) → viewer.
+        """
         grants = []
         for p in perminfos:
             allows = set(p.get("allow", []))
             denys = set(p.get("deny", []))
             if denys or "download" not in allows:
                 continue
-            relation = "viewer"
-            if allows >= {"display", "preview", "download", "modify", "create", "delete", "internal_sharing"}:
-                relation = "manager"
-            elif allows >= {"display", "preview", "download", "modify", "create"}:
-                relation = "editor"
 
             atype = p.get("accessortype", "user")
             aname = p.get("accessorname", "")
@@ -318,14 +333,14 @@ class SyncPipeline:
                 did = self._mapper.resolve_principal(aname, "department")
                 if did:
                     grants.append({"subject_type": "department", "subject_id": did,
-                                   "relation": relation, "include_children": False})
+                                   "relation": "viewer", "include_children": False})
             else:
                 from app.services.principal_mapper import parse_accessorname
                 uname, dname = parse_accessorname(aname)
                 uid = self._mapper.resolve_principal(dname or uname, "user")
                 if uid:
                     grants.append({"subject_type": "user", "subject_id": uid,
-                                   "relation": relation})
+                                   "relation": "viewer"})
         return grants
 
     def _build_grants_for_gns(self, gns: str) -> list[dict]:
@@ -394,7 +409,8 @@ class SyncPipeline:
             marker = None
             while True:
                 url = (f"{self._as_base}/api/efast/v1/folders/{quote(gns, safe='')}"
-                       f"/sub_objects?limit=200&sort=name&direction=asc")
+                       f"/sub_objects?limit=200&sort=name&direction=asc"
+                       f"&permission_attributes_required=false")
                 if marker:
                     url += f"&marker={marker}"
                 # Retry on transient network errors
@@ -693,13 +709,9 @@ class SyncPipeline:
 
         # Step 3: Build resource list and authorize
         def _translate_relation(allows: set) -> str | None:
+            # Any ACL entry with download → viewer (no role escalation)
             if "download" not in allows:
                 return None
-            if allows >= {"display", "preview", "download", "modify",
-                          "create", "delete", "internal_sharing"}:
-                return "manager"
-            if allows >= {"display", "preview", "download", "modify", "create"}:
-                return "editor"
             return "viewer"
 
         acl_items = []

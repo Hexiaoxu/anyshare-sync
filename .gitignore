@@ -23,3 +23,12 @@ _tmp_xlsx/
 _xlsx_data.json
 _xlsx_out.txt
 *.xlsx
+users_import.json
+
+# Binary/archive files
+*.tar.gz
+*.zip
+drivers/
+
+# Local config with real credentials
+config/config.yaml

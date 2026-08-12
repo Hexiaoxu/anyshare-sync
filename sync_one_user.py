@@ -11,25 +11,55 @@ BS = sys.argv[2] if len(sys.argv) > 2 else input("BISHENG Cookie: ").strip()
 LIB = sys.argv[3] if len(sys.argv) > 3 else input("AnyShare DocLib GNS: ").strip()
 USER_NAME = sys.argv[4] if len(sys.argv) > 4 else input("User Name: ").strip()
 
-AS_B = "https://5j-zsgl.powerchina.cn"
-BS_B = "http://192.168.106.161:3001"
+import sys as _sys; _sys.path.insert(0, '.')
+from app.config import cfg
+AS_B = cfg.as_base
+BS_B = cfg.bs_base
 
-# 1. Delete old spaces for this user
-print(f"=== Cleaning old '{USER_NAME}' spaces ===")
+# 1. 复用已有空间，或创建新空间
+print(f"\n=== Preparing space: {USER_NAME} ===")
 with httpx.Client(timeout=30) as c:
     r = c.get(f"{BS_B}/api/v1/knowledge/space/mine", cookies={"access_token_cookie": BS})
-    for sp in r.json()["data"]:
-        if USER_NAME in sp.get("name", ""):
-            c.delete(f"{BS_B}/api/v1/knowledge/space/{sp['id']}", cookies={"access_token_cookie": BS})
-            print(f"  Deleted: {sp['name']}")
+    existing = next((sp for sp in r.json()["data"] if sp.get("name") == USER_NAME), None)
 
-# 2. Create space
-print(f"\n=== Creating space: {USER_NAME} ===")
-r = httpx.post(f"{BS_B}/api/v1/knowledge/space",
-    json={"name": USER_NAME, "description": "AnyShare个人文档库", "auth_type": "public"},
-    cookies={"access_token_cookie": BS})
-SP = r.json()["data"]["id"]
+if existing:
+    SP = existing["id"]
+    print(f"  复用已有空间: {USER_NAME} (id={SP})")
+else:
+    # 2. Create space
+    print(f"  创建新空间: {USER_NAME}")
+    r = httpx.post(f"{BS_B}/api/v1/knowledge/space",
+        json={"name": USER_NAME, "description": "AnyShare个人文档库", "auth_type": "public"},
+        cookies={"access_token_cookie": BS})
+    resp = r.json()
+    data = resp.get("data", {})
+    SP = data.get("id") or data.get("knowledge_id") or data.get("space_id")
+    if not SP:
+        print(f"  [ERROR] 创建空间失败，返回: {resp}")
+        sys.exit(1)
 print(f"  id={SP}")
+
+# 2b. Grant owner (manager) permission to the user
+print(f"  Granting manager to {USER_NAME}...")
+try:
+    r_u = httpx.get(f"{BS_B}/api/v1/permissions/resources/knowledge_space/{SP}/grant-subjects/users",
+        params={"keyword": USER_NAME, "page": 1, "page_size": 5},
+        cookies={"access_token_cookie": BS}, timeout=10)
+    owner_uid = None
+    for u in r_u.json().get("data", []):
+        if u.get("user_name") == USER_NAME:
+            owner_uid = u.get("user_id"); break
+    if not owner_uid and r_u.json().get("data"):
+        owner_uid = r_u.json()["data"][0].get("user_id")
+    if owner_uid:
+        httpx.post(f"{BS_B}/api/v1/permissions/resources/knowledge_space/{SP}/authorize",
+            json={"grants": [{"subject_type": "user", "subject_id": owner_uid, "relation": "manager"}], "revokes": []},
+            cookies={"access_token_cookie": BS}, timeout=15)
+        print(f"  Granted manager to {USER_NAME} (user_id={owner_uid})")
+    else:
+        print(f"  [WARN] User {USER_NAME} not found in BISHENG, skipping grant")
+except Exception as e:
+    print(f"  [WARN] Grant failed: {e}")
 
 # 3. Scan (BFS recursive)
 print(f"\n=== Scanning (BFS recursive) ===")
@@ -144,80 +174,83 @@ print(f"\n=== Transfer done: {ok}/{len(all_files)} OK, {ng} failed ===")
 
 # ── Write mapping tables ────────────────────────────────────
 print(f"\n=== Writing mapping records ===")
-sys.path.insert(0, ".")
-from app.models import init_db, get_session
-from app.models.space_mapping import SyncSpaceMapping
-from app.models.document_mapping import SyncDocumentMapping
-from app.models.scan_run import SyncScanRun
-from app.models.audit_event import SyncAuditEvent
-from app.models.scope_config import SyncScopeConfig
-from sqlmodel import select, func
-import hashlib, datetime
-init_db()
+try:
+    sys.path.insert(0, ".")
+    from app.models import init_db, get_session
+    from app.models.space_mapping import SyncSpaceMapping
+    from app.models.document_mapping import SyncDocumentMapping
+    from app.models.scan_run import SyncScanRun
+    from app.models.audit_event import SyncAuditEvent
+    from app.models.scope_config import SyncScopeConfig
+    from sqlmodel import select, func
+    import hashlib, datetime
+    init_db()
 
-trace_id = uuid.uuid4().hex[:12]
-now = datetime.datetime.now()
+    trace_id = uuid.uuid4().hex[:12]
+    now = datetime.datetime.now()
 
-with get_session() as s:
-    # 1. Scope config - check existing
-    scope = s.exec(select(SyncScopeConfig).where(SyncScopeConfig.source_id == LIB)).first()
-    if not scope:
-        scope = SyncScopeConfig(
-            tenant_id=1, source_type="knowledge_doc_lib",
-            source_id=LIB, source_name=USER_NAME, enabled=True)
-    s.add(scope)
-    s.commit()
+    with get_session() as s:
+        # 1. Scope config - check existing
+        scope = s.exec(select(SyncScopeConfig).where(SyncScopeConfig.source_id == LIB)).first()
+        if not scope:
+            scope = SyncScopeConfig(
+                tenant_id=1, source_type="knowledge_doc_lib",
+                source_id=LIB, source_name=USER_NAME, enabled=True)
+        s.add(scope)
+        s.commit()
 
-    # 2. Scan run
-    scan = SyncScanRun(tenant_id=1, scan_type="manual", scope_config_id=scope.id,
-        total_files=len(all_files), new_files=len(all_files), status="completed",
-        started_at=now, completed_at=datetime.datetime.now())
-    s.add(scan)
-    s.commit()
+        # 2. Scan run
+        scan = SyncScanRun(tenant_id=1, scan_type="manual", scope_config_id=scope.id,
+            total_files=len(all_files), new_files=len(all_files), status="completed",
+            started_at=now, completed_at=datetime.datetime.now())
+        s.add(scan)
+        s.commit()
 
-    # 3. Space mapping - check existing first
-    existing = s.exec(select(SyncSpaceMapping).where(SyncSpaceMapping.source_doc_lib_id == LIB)).first()
-    if existing:
-        sm = existing
-        sm.target_space_id = SP
-        sm.status = "created"
-    else:
-        sm = SyncSpaceMapping(tenant_id=1, source_doc_lib_id=LIB,
-            source_doc_lib_name=USER_NAME, source_type="knowledge",
-            target_space_id=SP, status="created")
-    s.add(sm)
-    s.commit()
+        # 3. Space mapping - check existing first
+        existing = s.exec(select(SyncSpaceMapping).where(SyncSpaceMapping.source_doc_lib_id == LIB)).first()
+        if existing:
+            sm = existing
+            sm.target_space_id = SP
+            sm.status = "created"
+        else:
+            sm = SyncSpaceMapping(tenant_id=1, source_doc_lib_id=LIB,
+                source_doc_lib_name=USER_NAME, source_type="knowledge",
+                target_space_id=SP, status="created")
+        s.add(sm)
+        s.commit()
 
-    # 4. Document mappings - skip existing
-    for f in all_files:
-        if s.exec(select(SyncDocumentMapping).where(
-                SyncDocumentMapping.source_doc_id == f["id"])).first():
-            continue  # already synced in a previous run
-        key = hashlib.sha256(f"{LIB}|{f['id']}|{f.get('rev','')}".encode()).hexdigest()[:32]
-        dm = SyncDocumentMapping(tenant_id=1, space_mapping_id=sm.id,
-            source_doc_id=f["id"], source_rev=f.get("rev",""),
-            source_name=f["name"], source_size=f.get("size",0),
-            content_version=f.get("rev",""),
-            idempotency_key=key,
-            status="succeeded", last_seen_scan_id=scan.id)
-        s.add(dm)
+        # 4. Document mappings - skip existing
+        for f in all_files:
+            if s.exec(select(SyncDocumentMapping).where(
+                    SyncDocumentMapping.source_doc_id == f["id"])).first():
+                continue
+            key = hashlib.sha256(f"{LIB}|{f['id']}|{f.get('rev','')}".encode()).hexdigest()[:32]
+            dm = SyncDocumentMapping(tenant_id=1, space_mapping_id=sm.id,
+                source_doc_id=f["id"], source_rev=f.get("rev",""),
+                source_name=f["name"], source_size=f.get("size",0),
+                content_version=f.get("rev",""),
+                idempotency_key=key,
+                status="succeeded", last_seen_scan_id=scan.id)
+            s.add(dm)
 
-    # 5. Audit
-    s.add(SyncAuditEvent(tenant_id=1, trace_id=trace_id, action="sync",
-        source_type="knowledge_doc_lib", source_id=LIB,
-        target_type="knowledge_space", target_id=SP,
-        operator="system", result="success",
-        detail=f"Transferred {ok}/{len(all_files)} files"))
-    s.commit()
+        # 5. Audit
+        s.add(SyncAuditEvent(tenant_id=1, trace_id=trace_id, action="sync",
+            source_type="knowledge_doc_lib", source_id=LIB,
+            target_type="knowledge_space", target_id=SP,
+            operator="system", result="success",
+            detail=f"Transferred {ok}/{len(all_files)} files"))
+        s.commit()
 
-from sqlmodel import select, func
-with get_session() as s:
-    scope_cnt = s.exec(select(func.count()).select_from(SyncScopeConfig)).one()
-    scan_cnt = s.exec(select(func.count()).select_from(SyncScanRun)).one()
-    space_cnt = s.exec(select(func.count()).select_from(SyncSpaceMapping)).one()
-    doc_cnt = s.exec(select(func.count()).select_from(SyncDocumentMapping)).one()
-    audit_cnt = s.exec(select(func.count()).select_from(SyncAuditEvent)).one()
-    print(f"  DB: scope={scope_cnt} scan={scan_cnt} space={space_cnt} doc={doc_cnt} audit={audit_cnt}")
+    with get_session() as s:
+        scope_cnt = s.exec(select(func.count()).select_from(SyncScopeConfig)).one()
+        scan_cnt  = s.exec(select(func.count()).select_from(SyncScanRun)).one()
+        space_cnt = s.exec(select(func.count()).select_from(SyncSpaceMapping)).one()
+        doc_cnt   = s.exec(select(func.count()).select_from(SyncDocumentMapping)).one()
+        audit_cnt = s.exec(select(func.count()).select_from(SyncAuditEvent)).one()
+        print(f"  DB: scope={scope_cnt} scan={scan_cnt} space={space_cnt} doc={doc_cnt} audit={audit_cnt}")
+
+except Exception as _db_err:
+    print(f"  [WARN] DB mapping skipped: {_db_err}")
 
 # ── Permission Sync (optimized: one ACL call per item, targeted user lookup) ──
 print(f"\n=== Syncing ACL permissions ===")
@@ -304,6 +337,10 @@ print(f"  Resolved {len(bs_dept_map)}/{len(needed_depts)} departments")
 # Step 3: Build resource list and authorize
 synced_count = 0
 acl_items = []  # (name, any_gns, bs_id, resource_type)
+
+# 根目录（知识空间本身）加入权限同步
+acl_items.append((USER_NAME, LIB, SP, "knowledge_space"))
+
 for d in all_dirs:
     fid = folder_map.get(d["id"])
     if fid:
@@ -335,7 +372,7 @@ for name, any_gns, bs_id, res_type in acl_items:
             did = bs_dept_map.get(aname)
             if did:
                 grants.append({"subject_type": "department", "subject_id": did,
-                              "relation": relation, "include_children": True})
+                              "relation": relation})
         else:
             parts = aname.split("/**eisoo**/")
             display_name = parts[1] if len(parts) > 1 else parts[0]

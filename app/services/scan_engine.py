@@ -47,14 +47,19 @@ class ScanEngine:
         self._token = token
         _get_token = (lambda *a: token) if token else self._auth.get_app_token
         _get_user = (lambda *a: token) if token else self._auth.get_user_token
+        admin_account = config.anyshare.admin_account if hasattr(config.anyshare, "admin_account") else None
+        _get_scan_token = (lambda *a: token) if token else (
+            (lambda: self._auth.get_user_token(admin_account)) if admin_account else self._auth.get_app_token
+        )
         self._doclib = AnyShareDocLib(
             base_url=config.anyshare.base_url,
             get_app_token=_get_token,
             get_user_token=_get_user,
+            admin_account=admin_account,
         )
         self._scanner = AnyShareScanner(
             base_url=config.anyshare.base_url,
-            get_token=_get_token,
+            get_token=_get_scan_token,
         )
         self._diff = DiffCalculator()
 

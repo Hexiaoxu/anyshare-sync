@@ -1,127 +1,110 @@
-"""Configuration loader — reads config.yaml, env vars, with encrypted token support.
-
-Secrets (client_secret, cookie_value) can be stored as:
-  - Plain text in config.yaml (dev only)
-  - Environment variable (recommended for production)
-  - Fernet-encrypted value in config.yaml (prefix: "enc:")
-
-Encryption helper:
-  python -c "from app.config import encrypt; print(encrypt('my-secret'))"
 """
-
-from __future__ import annotations
-
+统一配置加载模块 — 从 config/config.yaml 读取所有配置
+用法: from app.config import cfg
+"""
 import os
 from pathlib import Path
-from dataclasses import dataclass, field
-
+from functools import lru_cache
 import yaml
 
-# Fernet key — in production, set via env var BS_ENCRYPTION_KEY
-_ENCRYPTION_KEY = os.getenv(
-    "BS_ENCRYPTION_KEY",
-    "TI31VYJ-ldAq-FXo5QNPKV_lqGTFfp-MIdbK2Hm5F1E=",
-)
+_CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.yaml"
 
 
-def _get_fernet():
-    from cryptography.fernet import Fernet
-    # Ensure key is valid base64
-    key = _ENCRYPTION_KEY
-    if len(key) < 44:
-        import base64
-        key = base64.urlsafe_b64encode(key.ljust(32)[:32].encode()).decode()
-    return Fernet(key.encode() if isinstance(key, str) else key)
+@lru_cache(maxsize=1)
+def _load() -> dict:
+    path = Path(os.environ.get("SYNC_CONFIG", _CONFIG_PATH))
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def encrypt(value: str) -> str:
-    """Encrypt a secret value for config.yaml storage."""
-    f = _get_fernet()
-    return "enc:" + f.encrypt(value.encode()).decode()
+class _Cfg:
+    """Dot-access wrapper around config.yaml."""
+
+    @property
+    def as_base(self) -> str:
+        return _load()["anyshare"]["base_url"].rstrip("/")
+
+    @property
+    def as_client_id(self) -> str:
+        return _load()["anyshare"]["client_id"]
+
+    @property
+    def as_client_secret(self) -> str:
+        return _load()["anyshare"]["client_secret"]
+
+    @property
+    def as_admin_account(self) -> str:
+        return _load()["anyshare"]["admin_account"]
+
+    @property
+    def as_console_user_id(self) -> str:
+        return _load()["anyshare"].get("console_user_id", "")
+
+    @property
+    def as_timeout(self) -> int:
+        return _load()["anyshare"].get("timeout", 30)
+
+    @property
+    def bs_base(self) -> str:
+        return _load()["bisheng"]["base_url"].rstrip("/")
+
+    @property
+    def bs_jwt_secret(self) -> str:
+        return _load()["bisheng"]["jwt_secret"]
+
+    @property
+    def bs_jwt_issuer(self) -> str:
+        return _load()["bisheng"].get("jwt_issuer", "bisheng")
+
+    @property
+    def bs_jwt_expire_seconds(self) -> int:
+        return _load()["bisheng"].get("jwt_expire_seconds", 86400)
+
+    @property
+    def bs_admin_user_id(self) -> int:
+        return _load()["bisheng"].get("jwt_admin_user_id", 1)
+
+    @property
+    def bs_admin_user_name(self) -> str:
+        return _load()["bisheng"].get("jwt_admin_user_name", "admin")
+
+    @property
+    def bs_admin_tenant_id(self) -> int:
+        return _load()["bisheng"].get("jwt_admin_tenant_id", 1)
+
+    @property
+    def bs_timeout(self) -> int:
+        return _load()["bisheng"].get("timeout", 30)
+
+    @property
+    def db(self) -> dict:
+        return _load()["database"]
+
+    @property
+    def sync(self) -> dict:
+        return _load()["sync"]
+
+    @property
+    def dept_lib_mode(self) -> str:
+        """部门文档库迁移模式: single 或 per_dept"""
+        return _load()["sync"].get("dept_lib_mode", "single")
+
+    @property
+    def trees(self) -> list:
+        return _load()["sync"].get("trees", [])
+
+    @property
+    def org_excel_path(self) -> str:
+        return _load().get("org_excel_path", "")
+
+    @property
+    def log_level(self) -> str:
+        return _load().get("logging", {}).get("level", "INFO")
+
+    @property
+    def scheduler_interval(self) -> int:
+        """增量同步间隔（秒），默认3600"""
+        return _load().get("scheduler", {}).get("interval_seconds", 3600)
 
 
-def decrypt(value: str) -> str:
-    """Decrypt a config value (plain or 'enc:'-prefixed)."""
-    if not value:
-        return value
-    if value.startswith("enc:"):
-        f = _get_fernet()
-        return f.decrypt(value[4:].encode()).decode()
-    return value
-
-
-@dataclass
-class AnyShareConfig:
-    base_url: str = "https://your-anyshare.example.com"
-    client_id: str = ""
-    client_secret: str = ""   # supports "enc:..." prefix
-    timeout: float = 30.0
-
-    def get_secret(self) -> str:
-        return decrypt(self.client_secret)
-
-
-@dataclass
-class BishengConfig:
-    base_url: str = "http://your-bisheng.example.com:7860"
-    cookie_value: str = ""    # supports "enc:..." prefix
-    timeout: float = 30.0
-
-    def get_cookie(self) -> str:
-        return decrypt(self.cookie_value)
-
-
-@dataclass
-class SyncConfig:
-    max_depth: int = 20
-    max_objects: int = 500_000
-    scan_timeout_minutes: int = 60
-    retry_max: int = 6
-    retry_backoff_seconds: int = 10
-    missing_threshold: int = 2
-    archive_days: int = 30
-    temp_dir: str = "/tmp/anyshare-sync"
-
-
-@dataclass
-class SchedulerConfig:
-    retry_due_seconds: int = 60
-    poll_ingestion_seconds: int = 45
-    daily_scan_time: str = "02:30"
-    daily_housekeeping_time: str = "02:00"
-
-
-@dataclass
-class AppConfig:
-    anyshare: AnyShareConfig = field(default_factory=AnyShareConfig)
-    bisheng: BishengConfig = field(default_factory=BishengConfig)
-    sync: SyncConfig = field(default_factory=SyncConfig)
-    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-
-
-def load_config(config_path: str | Path = None) -> AppConfig:
-    """Load configuration from YAML, env vars take precedence."""
-    if config_path is None:
-        config_path = Path(__file__).parent.parent / "config" / "config.yaml"
-
-    raw = {}
-    if Path(config_path).exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-
-    anyshare_raw = raw.get("anyshare", {})
-    bisheng_raw = raw.get("bisheng", {})
-
-    return AppConfig(
-        anyshare=AnyShareConfig(
-            base_url=os.getenv("ANYSHARE_URL", anyshare_raw.get("base_url", "")),
-            client_id=os.getenv("ANYSHARE_CLIENT_ID", anyshare_raw.get("client_id", "")),
-            client_secret=os.getenv("ANYSHARE_CLIENT_SECRET", anyshare_raw.get("client_secret", "")),
-        ),
-        bisheng=BishengConfig(
-            base_url=os.getenv("BISHENG_URL", bisheng_raw.get("base_url", "")),
-            cookie_value=os.getenv("BISHENG_COOKIE", bisheng_raw.get("cookie_value", "")),
-        ),
-        sync=SyncConfig(**raw.get("sync", {})),
-        scheduler=SchedulerConfig(**raw.get("scheduler", {})),
-    )
+cfg = _Cfg()

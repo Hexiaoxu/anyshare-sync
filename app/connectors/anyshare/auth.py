@@ -74,18 +74,24 @@ class AnyShareAuth:
             "Authorization": self._basic_auth,
             "Content-Type": "application/x-www-form-urlencoded",
         }
-        try:
-            resp = self._http.post(url, data=data, headers=headers)
-            self._raise_on_error(resp)
-            body = resp.json()
-            expires_in = body.get("expires_in", 3600)
-            return Token(
-                access_token=body["access_token"],
-                token_type=body.get("token_type", "bearer"),
-                expires_at=time.time() + expires_in,
-            )
-        except httpx.TimeoutException:
-            raise NetworkError("Timeout fetching app token")
+        for attempt in range(3):
+            try:
+                resp = self._http.post(url, data=data, headers=headers)
+                if resp.status_code in (502, 503, 429):
+                    import time as _t
+                    _t.sleep(5 * (attempt + 1))
+                    continue
+                self._raise_on_error(resp)
+                body = resp.json()
+                expires_in = body.get("expires_in", 3600)
+                return Token(
+                    access_token=body["access_token"],
+                    token_type=body.get("token_type", "bearer"),
+                    expires_at=time.time() + expires_in,
+                )
+            except httpx.TimeoutException:
+                raise NetworkError("Timeout fetching app token")
+        raise NetworkError("Auth server error: 502/503 after retries")
 
     # ── User Token ───────────────────────────────────────────
 
@@ -105,18 +111,24 @@ class AnyShareAuth:
             "Content-Type": "application/json",
         }
         body = {"account": account}
-        try:
-            resp = self._http.post(url, json=body, headers=headers)
-            self._raise_on_error(resp)
-            data = resp.json()
-            expires_in = data.get("expires_in", 3600)
-            return Token(
-                access_token=data["access_token"],
-                token_type=data.get("token_type", "bearer"),
-                expires_at=time.time() + expires_in,
-            )
-        except httpx.TimeoutException:
-            raise NetworkError(f"Timeout fetching user token for {account}")
+        for attempt in range(3):
+            try:
+                resp = self._http.post(url, json=body, headers=headers)
+                if resp.status_code in (502, 503, 429):
+                    import time as _t
+                    _t.sleep(5 * (attempt + 1))
+                    continue
+                self._raise_on_error(resp)
+                data = resp.json()
+                expires_in = data.get("expires_in", 3600)
+                return Token(
+                    access_token=data["access_token"],
+                    token_type=data.get("token_type", "bearer"),
+                    expires_at=time.time() + expires_in,
+                )
+            except httpx.TimeoutException:
+                raise NetworkError(f"Timeout fetching user token for {account}")
+        raise NetworkError(f"Auth server error: 502/503 after retries for {account}")
 
     # ── Helpers ──────────────────────────────────────────────
 

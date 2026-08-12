@@ -30,11 +30,11 @@ class TreeOrchestrator:
     """
 
     def __init__(self, bs_base: str, bs_cookie: str,
-                 as_base: str, as_token: str, as_auth=None):
+                 as_base: str, as_token: str, as_auth=None, as_account=None):
         self._pipeline = SyncPipeline(
             bs_base=bs_base, bs_cookie=bs_cookie,
             as_base=as_base, as_token=as_token,
-            as_auth=as_auth,
+            as_auth=as_auth, as_account=as_account,
         )
 
     def run_all(self) -> list[dict]:

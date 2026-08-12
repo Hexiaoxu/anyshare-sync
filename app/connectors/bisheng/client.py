@@ -23,13 +23,17 @@ class BishengClient:
     """HTTP client for BISHENG API.
 
     Auth: Cookie-based (access_token_cookie JWT).
+    If cookie_value is empty, auto-generates an admin JWT.
     IMPORTANT: BISHENG always returns HTTP 200 — real success/failure
     is in response body's ``status_code`` field.
     """
 
-    def __init__(self, base_url: str, cookie_value: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, cookie_value: str = "", timeout: float = 30.0):
         self._url = base_url.rstrip("/")
         self._timeout = timeout
+        if not cookie_value:
+            from app.connectors.bisheng.token_generator import generate_bs_token
+            cookie_value = generate_bs_token()
         self._cookie = {"access_token_cookie": cookie_value}
 
     # ── Low-level HTTP ──────────────────────────────────────

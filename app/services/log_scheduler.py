@@ -14,12 +14,13 @@ import httpx as hx
 
 from app.sync_pipeline import SyncPipeline
 from app.services.log_event_handler import LogEventHandler
+from app.config import cfg as _global_cfg
 
 logger = logging.getLogger("log_scheduler")
 
 CHECKPOINT_FILE = Path(__file__).parent.parent.parent / "data" / "log_sync_checkpoint.json"
 DEFAULT_INTERVAL = 3600  # 1 hour
-USER_ID = "3e7a9110-3de5-11ef-bb23-de677a88534a"  # admin user
+USER_ID = _global_cfg.as_console_user_id
 
 
 class LogSyncScheduler:
@@ -74,11 +75,21 @@ class LogSyncScheduler:
     # ── Log pull ───────────────────────────────────────────
 
     def _pull_logs(self, since_us: int, until_us: int) -> list[dict]:
-        """Pull document operation logs (logType=12) since last sync."""
+        """Pull all operation logs since last sync."""
         events = []
-        AS_BASE = "https://5j-zsgl.powerchina.cn"
+        from app.config import cfg as _cfg
+        AS_BASE = _cfg.as_base
 
-        for logType in [12]:
+        # 刷新 token
+        try:
+            from app.connectors.anyshare.auth import AnyShareAuth
+            auth = AnyShareAuth(AS_BASE, _cfg.as_client_id, _cfg.as_client_secret)
+            self._ct = auth.get_user_token(_cfg.as_admin_account)
+            logger.info("AnyShare token refreshed")
+        except Exception as e:
+            logger.warning(f"Token refresh failed, using existing: {e}")
+
+        for logType in [11, 12]:  # 11=组织, 12=文档 (10=登录 忽略)
             start = 0
             while True:
                 body = [{'ncTGetPageLogParam': {
@@ -87,7 +98,7 @@ class LogSyncScheduler:
                     'maxLogId': 9223372036854775807,
                     'logType': logType,
                     'levels': [], 'macs': [], 'ips': [], 'displayNames': [],
-                    'opTypes': [2, 11, 19, 22, 3, 24],
+                    'opTypes': [],  # 空=所有类型
                     'msgs': [], 'exMsgs': [],
                     'startDate': since_us,
                     'endDate': until_us,
