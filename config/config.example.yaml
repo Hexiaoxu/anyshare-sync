@@ -56,6 +56,10 @@ sync:
   archive_days: 30
   temp_dir: "/tmp/anyshare-sync"
 
+  # AnyShare Console 中确认属于“删除文件/目录”的文档 opType。
+  # 不同环境可能不同；未抓取样本确认前保持为空，避免误删 BISHENG 数据。
+  console_delete_op_types: []
+
   # ── 树形同步 ───────────────────────────────────────────────
   # 每个 tree = 一个 BISHENG 空间，子项作为文件夹
   # 根目录无权限，子目录和文件有权限

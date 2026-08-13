@@ -8,6 +8,7 @@ Run: python tests/integration/run_engine_full.py
 """
 
 import logging
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -35,13 +36,13 @@ logger = logging.getLogger("engine-full")
 # ── Config ────────────────────────────────────────────────
 config = AppConfig(
     anyshare=AnyShareConfig(
-        base_url="https://5j-zsgl.powerchina.cn",
+        base_url=os.environ.get("E2E_ANYSHARE_BASE", ""),
         client_id="test",  # not used with cookie token
         client_secret="test",
     ),
     bisheng=BishengConfig(
-        base_url="http://192.168.106.161:7860",
-        cookie_value="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ7XCJ1c2VyX2lkXCI6IDEsIFwidXNlcl9uYW1lXCI6IFwiYWRtaW5cIiwgXCJ0ZW5hbnRfaWRcIjogMSwgXCJ0b2tlbl92ZXJzaW9uXCI6IDF9IiwiZXhwIjoxNzg0MTAxMDk4LCJpc3MiOiJiaXNoZW5nIn0.U3OsX2VeLKjKKoFyA4UkBQ91sy1VSU6zjE_mkrjpKpg",
+        base_url=os.environ.get("E2E_BISHENG_BASE", ""),
+        cookie_value=os.environ.get("E2E_BISHENG_COOKIE", ""),
     ),
     sync=SyncConfig(max_depth=3, max_objects=100, temp_dir=str(Path.home() / "AppData" / "Local" / "Temp" / "anyshare-sync")),
     scheduler=SchedulerConfig(),
@@ -49,6 +50,8 @@ config = AppConfig(
 
 # ── Main ───────────────────────────────────────────────────
 def main():
+    if os.environ.get("RUN_REAL_E2E") != "1":
+        raise SystemExit("Set RUN_REAL_E2E=1 and E2E_* credentials")
     init_db()
     trace_id = uuid.uuid4().hex[:12]
     logger.info(f"=== Engine Full Run — trace_id={trace_id} ===")
@@ -75,7 +78,7 @@ def main():
             logger.info(f"Created scope id={scope_id}")
 
     # 2. Run ScanEngine with browser token
-    AS_TOKEN = "ory_at_RM7bAaE8zEeGAlbzehHMZDcvVSJLJhnVvjTXqd929U8.Y0UaOt-Nj3P-o1s69oNFuHPxlgLR18plRRE83ZhT-eM"
+    AS_TOKEN = os.environ.get("E2E_ANYSHARE_TOKEN", "")
     logger.info("=== Step 1: ScanEngine.run_full_scan() ===")
     engine = ScanEngine(config, token=AS_TOKEN)
     results = engine.run_full_scan(tenant_id=1)
@@ -103,7 +106,7 @@ def main():
             # Create space in BISHENG
             import httpx
             r = httpx.Client(timeout=30).post(
-                "http://192.168.106.161:7860/api/v1/knowledge/space",
+                f"{config.bisheng.base_url}/api/v1/knowledge/space",
                 json={"name": "5jliming1_personal", "description": "Engine test", "auth_type": "public"},
                 cookies={"access_token_cookie": config.bisheng.cookie_value},
             )

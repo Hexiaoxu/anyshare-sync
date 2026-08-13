@@ -20,6 +20,7 @@ from app.services.principal_mapper import PrincipalMapper, parse_accessorname
 from app.models import init_db, get_session
 from app.models.space_mapping import SyncSpaceMapping
 from app.models.document_mapping import SyncDocumentMapping
+from app.models.folder_mapping import SyncFolderMapping
 from app.models.scan_run import SyncScanRun
 from app.models.audit_event import SyncAuditEvent
 from app.models.scope_config import SyncScopeConfig
@@ -91,6 +92,89 @@ class SyncPipeline:
         if not hasattr(self, '_bs_folder_by_path'):
             self._bs_folder_by_path: dict[str, int] = {}
 
+    def restore_state(self) -> dict:
+        """Restore persistent AnyShare → BISHENG mappings after a restart."""
+        init_db()
+        folders = files = spaces = 0
+        with get_session() as session:
+            for mapping in session.exec(select(SyncSpaceMapping)).all():
+                if mapping.target_space_id:
+                    spaces += 1
+            for mapping in session.exec(select(SyncFolderMapping)).all():
+                if mapping.target_folder_id and mapping.status != "deleted":
+                    gns = mapping.source_folder_id
+                    self._folder_map[gns] = mapping.target_folder_id
+                    self._uuid_to_gns[self._extract_uuid(gns)] = gns
+                    self._gns_to_name[gns] = mapping.source_name
+                    if mapping.source_path:
+                        self._bs_folder_by_path[mapping.source_path] = mapping.target_folder_id
+                    folders += 1
+            for mapping in session.exec(select(SyncDocumentMapping)).all():
+                if mapping.target_file_id and mapping.status != "deleted":
+                    gns = mapping.source_doc_id
+                    self._file_map[gns] = mapping.target_file_id
+                    self._uuid_to_gns[self._extract_uuid(gns)] = gns
+                    self._gns_to_name[gns] = mapping.source_name
+                    files += 1
+        logger.info("Restored mappings: %s spaces, %s folders, %s files",
+                    spaces, folders, files)
+        return {"spaces": spaces, "folders": folders, "files": files}
+
+    def persist_event_mapping(self, gns: str, target_id: int,
+                              resource_type: str, name: str = "",
+                              space_id: int | None = None) -> bool:
+        """Persist a mapping created by a log event immediately."""
+        init_db()
+        with get_session() as session:
+            spaces = session.exec(select(SyncSpaceMapping)).all()
+            space = next((m for m in sorted(
+                spaces, key=lambda item: len(item.source_doc_lib_id), reverse=True)
+                if gns == m.source_doc_lib_id or
+                gns.startswith(m.source_doc_lib_id.rstrip("/") + "/")), None)
+            if not space:
+                logger.warning("Cannot persist event mapping without space: %s", gns)
+                return False
+            resolved_space_id = space_id or space.target_space_id
+            if resource_type == "folder":
+                parent_gns = gns.rsplit("/", 1)[0]
+                parent = session.exec(select(SyncFolderMapping).where(
+                    SyncFolderMapping.source_folder_id == parent_gns)).first()
+                mapping = session.exec(select(SyncFolderMapping).where(
+                    SyncFolderMapping.source_folder_id == gns)).first()
+                if mapping:
+                    mapping.source_name = name or mapping.source_name
+                    mapping.target_folder_id = target_id
+                    mapping.target_space_id = resolved_space_id
+                    mapping.target_parent_id = parent.target_folder_id if parent else None
+                    mapping.status = "active"
+                else:
+                    session.add(SyncFolderMapping(
+                        tenant_id=1, space_mapping_id=space.id,
+                        source_folder_id=gns, source_parent_id=parent_gns,
+                        source_name=name or self._extract_uuid(gns),
+                        source_path=gns, target_space_id=resolved_space_id,
+                        target_folder_id=target_id,
+                        target_parent_id=parent.target_folder_id if parent else None,
+                        status="active"))
+            else:
+                mapping = session.exec(select(SyncDocumentMapping).where(
+                    SyncDocumentMapping.source_doc_id == gns)).first()
+                if mapping:
+                    mapping.source_name = name or mapping.source_name
+                    mapping.target_file_id = target_id
+                    mapping.status = "succeeded"
+                    mapping.retry_count = 0
+                else:
+                    key = hashlib.sha256(f"{space.source_doc_lib_id}|{gns}".encode()).hexdigest()[:32]
+                    session.add(SyncDocumentMapping(
+                        tenant_id=1, space_mapping_id=space.id,
+                        source_doc_id=gns,
+                        source_name=name or self._extract_uuid(gns),
+                        target_file_id=target_id, idempotency_key=key,
+                        status="succeeded"))
+            session.commit()
+        return True
+
     # ── Main entry ──────────────────────────────────────────
 
     def run(self, lib_gns: str, space_name: str,
@@ -121,7 +205,15 @@ class SyncPipeline:
             # 0. Space setup
             if incremental:
                 self._space_id = self._find_or_create_space(space_name)
+                self.restore_state()
             else:
+                # A TreeOrchestrator reuses one pipeline across spaces. Never
+                # leak mappings from the previous full-sync space.
+                self._folder_map = {}
+                self._file_map = {}
+                self._uuid_to_gns = {}
+                self._gns_to_name = {}
+                self._bs_folder_by_path = {}
                 self._cleanup_old(space_name)
                 self._space_id = self._bs_space.create_personal(
                     space_name, "AnyShare文档迁移")
@@ -161,7 +253,8 @@ class SyncPipeline:
                         + (f", {skipped} skipped" if skipped else ""))
 
             # 3. Create folder structure
-            self._create_folders(all_dirs, lib_gns, ancestor_parent)
+            self._create_folders(all_dirs, lib_gns, ancestor_parent,
+                                 incremental=incremental)
             logger.info(f"Folders: {len(self._folder_map)} created")
 
             # 4. Transfer files (incremental: skip existing)
@@ -175,12 +268,15 @@ class SyncPipeline:
 
             ok, ng = 0, 0
             if not skip_download and transfer_files:
-                ok, ng = self._transfer_files(transfer_files, lib_gns, ancestor_parent)
+                ok, ng = self._transfer_files(
+                    transfer_files, lib_gns, ancestor_parent,
+                    preserve_existing=incremental)
                 logger.info(f"Transfer: {ok}/{len(transfer_files)} OK, {ng} failed")
 
             # 5. Write mapping tables
-            scan_id = self._write_mappings(lib_gns, space_name, source_type,
-                                           all_files, ok, trace_id, start_time)
+            scan_id = self._write_mappings(
+                lib_gns, space_name, source_type, all_dirs, all_files,
+                ok, trace_id, start_time)
 
             # 6. Sync permissions
             synced, total = self._sync_permissions(
@@ -380,9 +476,16 @@ class SyncPipeline:
                 return sp["id"]
         return self._bs_space.create_personal(name, "AnyShare文档迁移")
 
-    def _scan(self, lib_gns: str, max_depth: int = 6,
-              max_dirs: int = 500, max_files: int = 2000) -> tuple[list, list, int]:
+    def _scan(self, lib_gns: str, max_depth: int | None = None,
+              max_dirs: int | None = None,
+              max_files: int | None = None) -> tuple[list, list, int]:
         """BFS scan with marker pagination. Returns (all_dirs, all_files, skipped_count)."""
+        from app.config import cfg
+        sync_cfg = cfg.sync
+        max_depth = max_depth if max_depth is not None else int(sync_cfg.get("max_depth", 6))
+        max_objects = int(sync_cfg.get("max_objects_per_scan", 2500))
+        max_dirs = max_dirs if max_dirs is not None else int(sync_cfg.get("max_dirs_per_scan", max_objects))
+        max_files = max_files if max_files is not None else int(sync_cfg.get("max_files_per_scan", max_objects))
         all_dirs, all_files = [], []
         skipped = 0
         # Ensure attributes exist (defensive against stale pyc)
@@ -433,7 +536,8 @@ class SyncPipeline:
                         import time as _t
                         _t.sleep(10)
                         continue
-                    break
+                    raise RuntimeError(
+                        f"AnyShare scan failed HTTP {r.status_code} for {gns}: {r.text[:200]}")
 
                 sub = r.json()
                 for d in sub.get("dirs", []):
@@ -483,9 +587,11 @@ class SyncPipeline:
         return new_files, skipped
 
     def _create_folders(self, all_dirs: list, lib_gns: str,
-                        ancestor_parent: int | None):
+                        ancestor_parent: int | None,
+                        incremental: bool = False):
         """Create BISHENG folders matching AnyShare hierarchy."""
-        self._folder_map = {}
+        if not incremental:
+            self._folder_map = {}
         for d in sorted(all_dirs, key=lambda x: x["id"].count("/")):
             nm = d["name"]
             parent_gns = d["id"].rsplit("/", 1)[0] if "/" in d["id"] else ""
@@ -498,18 +604,25 @@ class SyncPipeline:
                 parent_id = None
 
             try:
-                fid = self._bs_folder.create(self._space_id, nm, parent_id=parent_id)
+                fid = self._folder_map.get(d["id"])
+                if not fid and incremental:
+                    fid = self._find_folder_by_name(nm, parent_id)
+                if not fid:
+                    fid = self._bs_folder.create(
+                        self._space_id, nm, parent_id=parent_id)
                 self._folder_map[d["id"]] = fid
             except Exception as e:
                 logger.warning(f"Folder create failed: {nm} — {e}")
 
     def _transfer_files(self, all_files: list, lib_gns: str,
-                        ancestor_parent: int | None) -> tuple[int, int]:
+                        ancestor_parent: int | None,
+                        preserve_existing: bool = False) -> tuple[int, int]:
         """Download from AnyShare → upload to BISHENG → register. Returns (ok, ng)."""
         td = Path.home() / "AppData" / "Local" / "Temp" / "as_sync" / uuid.uuid4().hex[:8]
         td.mkdir(parents=True, exist_ok=True)
         ok, ng = 0, 0
-        self._file_map = {}
+        if not preserve_existing:
+            self._file_map = {}
 
         # Shared client for connection reuse (avoids SSL flood)
         _shared_client = httpx.Client(timeout=120)
@@ -569,7 +682,15 @@ class SyncPipeline:
                         else self._folder_map.get(parent_gns))
                 reg = self._bs_file.register(self._space_id, fp, parent_id=pfid)
                 fid = reg["id"]
+                old_fid = self._file_map.get(did) if preserve_existing else None
                 self._file_map[did] = fid
+                if old_fid and old_fid != fid:
+                    try:
+                        self._bs_file.delete_file(self._space_id, old_fid)
+                    except Exception as delete_error:
+                        logger.warning(
+                            "Old version cleanup failed: %s (id=%s) — %s",
+                            nm[:50], old_fid, delete_error)
 
                 ok += 1
                 lp.unlink(missing_ok=True)
@@ -581,7 +702,7 @@ class SyncPipeline:
         return ok, ng
 
     def _write_mappings(self, lib_gns: str, space_name: str, source_type: str,
-                        all_files: list, transferred: int,
+                        all_dirs: list, all_files: list, transferred: int,
                         trace_id: str, start_time) -> int | None:
         """Write sync state to mapping tables. Returns scan_run id."""
         init_db()
@@ -623,14 +744,55 @@ class SyncPipeline:
                 s.add(sm)
             s.commit()
 
+            # Folder mappings — needed to resume log-driven sync after restart.
+            for d in all_dirs:
+                target_id = self._folder_map.get(d["id"])
+                if not target_id:
+                    continue
+                parent_gns = d["id"].rsplit("/", 1)[0]
+                target_parent = (None if parent_gns == lib_gns
+                                 else self._folder_map.get(parent_gns))
+                folder = s.exec(select(SyncFolderMapping).where(
+                    SyncFolderMapping.source_folder_id == d["id"])).first()
+                if folder:
+                    folder.space_mapping_id = sm.id
+                    folder.source_parent_id = parent_gns
+                    folder.source_name = d["name"]
+                    folder.source_path = d["id"]
+                    folder.target_space_id = self._space_id
+                    folder.target_folder_id = target_id
+                    folder.target_parent_id = target_parent
+                    folder.last_seen_scan_id = scan_id
+                    folder.missing_count = 0
+                    folder.status = "active"
+                else:
+                    s.add(SyncFolderMapping(
+                        tenant_id=1, space_mapping_id=sm.id,
+                        source_folder_id=d["id"], source_parent_id=parent_gns,
+                        source_name=d["name"], source_rev=d.get("rev", ""),
+                        source_path=d["id"], target_space_id=self._space_id,
+                        target_folder_id=target_id, target_parent_id=target_parent,
+                        level=max(0, d["id"].count("/") - lib_gns.count("/")),
+                        last_seen_scan_id=scan_id, status="active"))
+
             # Document mappings — insert new, update last_seen for existing
             for f in all_files:
+                target_id = self._file_map.get(f["id"])
                 existing = s.exec(select(SyncDocumentMapping).where(
                     SyncDocumentMapping.source_doc_id == f["id"])).first()
                 if existing:
                     existing.last_seen_scan_id = scan_id
-                    existing.source_rev = f.get("rev", "")
                     existing.source_size = f.get("size", 0)
+                    existing.source_name = f["name"]
+                    if target_id:
+                        existing.source_rev = f.get("rev", "")
+                        existing.content_version = f.get("rev", "")
+                        existing.target_file_id = target_id
+                        existing.status = "succeeded"
+                        existing.retry_count = 0
+                    else:
+                        existing.status = "failed"
+                        existing.retry_count = (existing.retry_count or 0) + 1
                     continue
                 key = hashlib.sha256(
                     f"{lib_gns}|{f['id']}|{f.get('rev','')}".encode()
@@ -640,7 +802,9 @@ class SyncPipeline:
                     source_doc_id=f["id"], source_rev=f.get("rev", ""),
                     source_name=f["name"], source_size=f.get("size", 0),
                     content_version=f.get("rev", ""), idempotency_key=key,
-                    status="succeeded" if self._file_map.get(f["id"]) else "pending",
+                    target_file_id=target_id,
+                    status="succeeded" if target_id else "failed",
+                    retry_count=0 if target_id else 1,
                     last_seen_scan_id=scan_id))
 
             # Audit

@@ -74,9 +74,10 @@ class LogSyncScheduler:
 
     # ── Log pull ───────────────────────────────────────────
 
-    def _pull_logs(self, since_us: int, until_us: int) -> list[dict]:
-        """Pull all operation logs since last sync."""
+    def _pull_logs(self, since_us: int, until_us: int) -> tuple[list[dict], bool]:
+        """Pull all logs. The bool is False if any page/type was incomplete."""
         events = []
+        complete = True
         from app.config import cfg as _cfg
         AS_BASE = _cfg.as_base
 
@@ -111,6 +112,7 @@ class LogSyncScheduler:
                                  'Content-Type': 'application/json;charset=UTF-8'})
                     if r.status_code != 200:
                         logger.warning(f"Log pull HTTP {r.status_code}: {r.text[:100]}")
+                        complete = False
                         break
                     data = r.json()
                     if not data:
@@ -121,8 +123,9 @@ class LogSyncScheduler:
                         break
                 except Exception as e:
                     logger.error(f"Log pull error: {e}")
+                    complete = False
                     break
-        return events
+        return events, complete
 
     # ── Main loop ──────────────────────────────────────────
 
@@ -139,7 +142,12 @@ class LogSyncScheduler:
         until_us = self._now_us()
         logger.info(f"Pulling logs: {self._fmt_ts(since_us)} → {self._fmt_ts(until_us)}")
 
-        events = self._pull_logs(since_us, until_us)
+        events, complete = self._pull_logs(since_us, until_us)
+        if not complete:
+            logger.error("Log pull incomplete; checkpoint retained at %s",
+                         self._fmt_ts(since_us))
+            return {"status": "retry", "events": len(events),
+                    "errors": 1, "reason": "log_pull_incomplete"}
         if not events:
             logger.info("No new events")
             self._save_checkpoint(until_us)
@@ -147,6 +155,11 @@ class LogSyncScheduler:
 
         logger.info(f"Processing {len(events)} events...")
         result = self._handler.handle(events)
+
+        if result.get("errors", 0):
+            logger.error("Cycle has %s handler error(s); checkpoint retained at %s",
+                         result["errors"], self._fmt_ts(since_us))
+            return {"status": "retry", "events": len(events), **result}
 
         self._save_checkpoint(until_us)
         logger.info(f"Cycle done: {result}")

@@ -312,8 +312,17 @@ docker compose --profile job run --rm sync-job python3 migrate_all.py --with-fil
 2. 刷新 AnyShare 管理员 Token。
 3. 拉取 Console 中组织类和文档类操作日志。
 4. 根据事件类型创建、更新或删除文件/目录，刷新 ACL，或同步组织变化。
-5. 处理完成后把当前时间写回 checkpoint。
+5. 全部事件处理成功后把当前时间写回 checkpoint；任何事件失败则保留旧 checkpoint，下一轮重试。
 6. 等待下一轮，默认间隔 3600 秒。
+
+删除事件的 `opType` 在不同 AnyShare 环境可能不同。必须先从本环境 Console 日志确认编号，再配置：
+
+```yaml
+sync:
+  console_delete_op_types: []  # 例如确认后填写 [实际编号]
+```
+
+保持空数组时不会删除 BISHENG 资源，这是默认的安全行为。
 
 可通过命令行覆盖间隔：
 
@@ -347,8 +356,9 @@ docker inspect anyshare-sync-daemon
 
 - 当前镜像为 `linux/amd64`，其中的达梦驱动不能直接用于 ARM64。
 - 部门库没有可用下载权限时，只能设置 `skip_download: true`。
-- `SyncPipeline._scan()` 当前实际限制为深度 6、目录 500、文件 2000；`config.yaml` 中的 `max_depth` 和 `max_objects_per_scan` 尚未接入该路径。
-- daemon 新建进程后不会从数据库完整恢复 UUID、目录和文件的内存映射，部分更新、删除或 ACL 事件可能因找不到映射而跳过。
+- BISHENG 管理员 JWT 会在到期前 5 分钟自动刷新；遇到 HTTP 或业务状态 401/403 时也会刷新并重试一次。
+- daemon 会从空间、文件夹和文件映射表恢复增量上下文；首次启用本版本前应先执行一次全量或 rev 增量，让旧数据补齐目标 ID。
+- 删除事件默认关闭，必须确认本环境 Console 的删除 `opType` 后配置 `console_delete_op_types`。
 - `PermissionGate` 尚未接入主流水线；当前行为是上传资源后逐条跳过无法安全转换的 ACL。
 - 权限翻译当前统一为 `viewer`，尚未按 AnyShare 的修改、删除等操作位映射成 `editor` 或 `manager`。
 - `scheduler.daily_scan_time`、`daily_housekeeping_time` 等配置尚未接入当前 daemon；实际使用 `scheduler.interval_seconds`，缺省为 3600 秒。

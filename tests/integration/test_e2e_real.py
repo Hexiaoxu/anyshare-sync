@@ -10,9 +10,11 @@ Run: python tests/integration/test_e2e_real.py
 """
 
 import sys
+import os
 sys.path.insert(0, ".")
 
 import logging
+import pytest
 from app.models import init_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -21,11 +23,15 @@ logger = logging.getLogger("e2e")
 # ============================================================
 # CONFIG — update these with real credentials before running
 # ============================================================
-ANYSHARE_BASE = "https://5j-zsgl.powerchina.cn"
-ANYSHARE_TOKEN = "ory_at_w1utXmu10Aw1QJdmxmLRFM6pTta9BjSXTVNgqa2FJPc.fNh0Xb_Ozv2ORR7VnCyXkiJfwv_VSb8VnQNE3AtZaWE"
+ANYSHARE_BASE = os.environ.get("E2E_ANYSHARE_BASE", "")
+ANYSHARE_TOKEN = os.environ.get("E2E_ANYSHARE_TOKEN", "")
+BISHENG_BASE = os.environ.get("E2E_BISHENG_BASE", "")
+BISHENG_COOKIE = os.environ.get("E2E_BISHENG_COOKIE", "")
 
-BISHENG_BASE = "http://192.168.106.161:7860"
-BISHENG_COOKIE = "access_token_cookie=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ7XCJ1c2VyX2lkXCI6IDEsIFwidXNlcl9uYW1lXCI6IFwiYWRtaW5cIiwgXCJ0ZW5hbnRfaWRcIjogMSwgXCJ0b2tlbl92ZXJzaW9uXCI6IDF9IiwiZXhwIjoxNzg0MTAxMDk4LCJpc3MiOiJiaXNoZW5nIn0.U3OsX2VeLKjKKoFyA4UkBQ91sy1VSU6zjE_mkrjpKpg"
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_REAL_E2E") != "1",
+    reason="real E2E disabled; set RUN_REAL_E2E=1 and E2E_* credentials",
+)
 
 
 def main():

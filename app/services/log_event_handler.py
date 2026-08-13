@@ -87,13 +87,21 @@ class LogEventHandler:
         self._bs_cookie = bs_cookie
         self._bs_base = pipeline._bs._url
         self._stats: dict[EventAction, int] = {}
+        from app.config import cfg
+        configured = cfg.sync.get("console_delete_op_types", [])
+        self._delete_op_types = {int(value) for value in configured}
+
+    def _action_for(self, event: LogEvent) -> EventAction:
+        if event.log_type == 12 and event.op_type in self._delete_op_types:
+            return EventAction.DELETE
+        return event.action
 
     def handle(self, events: list[dict]) -> dict:
         self._stats = {a: 0 for a in EventAction}
         errors = 0
         for entry in events:
             event = self._parse(entry)
-            action = event.action
+            action = self._action_for(event)
             try:
                 handler = _HANDLERS.get(action)
                 if handler:
@@ -121,8 +129,9 @@ class LogEventHandler:
         res_type = "folder" if gns in self._pipeline._folder_map else "knowledge_file"
         grants = self._pipeline._build_grants_for_gns(gns)
         if grants:
-            self._pipeline._bs_perm.authorize(res_type, bs_id, grants=grants,
-                                              timeout=60, retries=2)
+            if not self._pipeline._bs_perm.authorize(
+                    res_type, bs_id, grants=grants, timeout=60, retries=2):
+                raise RuntimeError(f"BISHENG authorization failed for {res_type} {bs_id}")
 
     def _handle_new_file(self, event: LogEvent):
         """OP2/OP19: Download from AnyShare → upload → register → authorize."""
@@ -149,6 +158,23 @@ class LogEventHandler:
         if not space_id:
             logger.warning(f"Cannot resolve space_id for {name}, skipping")
             return
+
+        # Checkpoint replay is expected after a partial failure. Create/copy
+        # events reuse the persisted target and only retry authorization.
+        existing_id = self._pipeline._file_map.get(gns) if gns else None
+        if existing_id and event.op_type in (2, 24):
+            grants = self._pipeline._build_grants_for_gns(gns)
+            if grants and not self._pipeline._bs_perm.authorize(
+                    "knowledge_file", existing_id, grants=grants,
+                    timeout=60, retries=2):
+                raise RuntimeError(
+                    f"BISHENG authorization failed for file {existing_id}")
+            logger.info("Reused existing file for replay: %s -> BS id=%s",
+                        name[:50], existing_id)
+            return
+        if existing_id and event.op_type in (4, 19):
+            self._pipeline._bs_file.delete_file(space_id, existing_id)
+            self._pipeline._file_map.pop(gns, None)
 
         # docid for download
         docid = gns if gns else event.obj_id
@@ -190,13 +216,18 @@ class LogEventHandler:
             if gns:
                 self._pipeline._file_map[gns] = fid
                 self._pipeline._gns_to_name[gns] = name
+                self._pipeline._uuid_to_gns[event.obj_id] = gns
+                self._pipeline.persist_event_mapping(
+                    gns, fid, "knowledge_file", name=name, space_id=space_id)
 
             # Authorize
             if gns:
                 grants = self._pipeline._build_grants_for_gns(gns)
                 if grants:
-                    self._pipeline._bs_perm.authorize(
-                        "knowledge_file", fid, grants=grants, timeout=60, retries=2)
+                    if not self._pipeline._bs_perm.authorize(
+                            "knowledge_file", fid, grants=grants,
+                            timeout=60, retries=2):
+                        raise RuntimeError(f"BISHENG authorization failed for file {fid}")
 
             local.unlink(missing_ok=True)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -204,6 +235,7 @@ class LogEventHandler:
 
         except Exception as e:
             logger.error(f"Failed to sync file {docid} ({name[:40]}): {e}")
+            raise
 
     def _handle_new_folder(self, event: LogEvent):
         """OP22: Create folder in BISHENG, matching AnyShare parent structure."""
@@ -214,22 +246,43 @@ class LogEventHandler:
 
         name = self._extract_filename(event)
         parent_id = self._find_parent_bs_id(gns, event)
+        space_id = self._resolve_space_id_from_gns(gns)
+        if not space_id:
+            raise RuntimeError(f"Cannot resolve space_id for folder {gns}")
+
+        existing_id = self._pipeline._folder_map.get(gns)
+        if existing_id:
+            grants = self._pipeline._build_grants_for_gns(gns)
+            if grants and not self._pipeline._bs_perm.authorize(
+                    "folder", existing_id, grants=grants,
+                    timeout=60, retries=2):
+                raise RuntimeError(
+                    f"BISHENG authorization failed for folder {existing_id}")
+            logger.info("Reused existing folder for replay: %s -> BS id=%s",
+                        name[:40], existing_id)
+            return
 
         try:
             fid = self._pipeline._bs_folder.create(
-                self._pipeline._space_id, name, parent_id=parent_id)
+                space_id, name, parent_id=parent_id)
             self._pipeline._folder_map[gns] = fid
             self._pipeline._gns_to_name[gns] = name
+            self._pipeline._uuid_to_gns[event.obj_id] = gns
+            self._pipeline.persist_event_mapping(
+                gns, fid, "folder", name=name,
+                space_id=space_id)
 
             # Authorize
             grants = self._pipeline._build_grants_for_gns(gns)
             if grants:
-                self._pipeline._bs_perm.authorize(
-                    "folder", fid, grants=grants, timeout=60, retries=2)
+                if not self._pipeline._bs_perm.authorize(
+                        "folder", fid, grants=grants, timeout=60, retries=2):
+                    raise RuntimeError(f"BISHENG authorization failed for folder {fid}")
 
             logger.info(f"Synced new folder: {name[:40]} -> BS id={fid}")
         except Exception as e:
             logger.error(f"Failed to create folder {name[:40]}: {e}")
+            raise
 
     def _handle_delete(self, event: LogEvent):
         """OP3/OP24: Delete file/folder from BISHENG and mark DB as deleted."""
@@ -243,18 +296,23 @@ class LogEventHandler:
 
         if bs_id:
             try:
+                space_id = self._resolve_space_id_from_gns(gns)
+                if not space_id:
+                    raise RuntimeError(f"Cannot resolve space_id for delete {gns}")
                 if is_folder:
-                    self._pipeline._bs_folder.delete(self._pipeline._space_id, bs_id)
+                    self._pipeline._bs_folder.delete(space_id, bs_id)
                     del self._pipeline._folder_map[gns]
                 else:
-                    self._pipeline._bs_file.delete_file(self._pipeline._space_id, bs_id)
+                    self._pipeline._bs_file.delete_file(space_id, bs_id)
                     del self._pipeline._file_map[gns]
                 logger.info(f"Deleted {'folder' if is_folder else 'file'} bs_id={bs_id} gns={gns[-20:]}")
             except Exception as e:
                 logger.warning(f"BISHENG delete failed bs_id={bs_id}: {e}")
+                raise
 
         from app.models import get_session
         from app.models.document_mapping import SyncDocumentMapping
+        from app.models.folder_mapping import SyncFolderMapping
         from sqlmodel import select
         with get_session() as s:
             dm = s.exec(select(SyncDocumentMapping).where(
@@ -263,6 +321,12 @@ class LogEventHandler:
                 dm.status = "deleted"
                 s.commit()
                 logger.info(f"Marked deleted in DB: {dm.source_name}")
+            fm = s.exec(select(SyncFolderMapping).where(
+                SyncFolderMapping.source_folder_id == gns)).first()
+            if fm:
+                fm.status = "deleted"
+                s.commit()
+                logger.info(f"Marked folder deleted in DB: {fm.source_name}")
 
     # ═══════════════════════════════════════════════════════════
     # Organization handlers
@@ -276,29 +340,29 @@ class LogEventHandler:
 
         try:
             # Check if user already exists via user list API
-            r = httpx.get(
-                f"{self._bs_base}/api/v1/user/list",
+            r = self._pipeline._bs._get(
+                "/api/v1/user/list",
                 params={"keyword": username, "page": 1, "page_size": 5},
-                cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
-            for u in r.json().get("data", {}).get("data", []):
+                timeout=15)
+            data = self._pipeline._bs.ok(r)
+            for u in data.get("data", {}).get("data", []):
                 if u.get("external_id") == username or u.get("user_name") == display_name:
                     logger.debug(f"User already exists: {username}")
                     return
 
             # Create user via regist API (same as import_org.py)
-            r2 = httpx.post(
-                f"{self._bs_base}/api/v1/user/regist",
-                json={"user_name": display_name or username,
-                      "user_id": username,
-                      "password": "Sync@123456",
-                      "source": "local"},
-                cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
-            if r2.status_code == 200:
-                logger.info(f"Created user: {username}")
-            else:
-                logger.warning(f"Create user failed: {r2.text[:100]}")
+            r2 = self._pipeline._bs._post(
+                "/api/v1/user/regist",
+                {"user_name": display_name or username,
+                 "user_id": username,
+                 "password": "Sync@123456",
+                 "source": "local"},
+                timeout=15)
+            self._pipeline._bs.ok(r2)
+            logger.info(f"Created user: {username}")
         except Exception as e:
             logger.warning(f"Create user error {username}: {e}")
+            raise
 
     def _handle_create_dept(self, event: LogEvent):
         """OP1 in LT11: Create department in BISHENG.
@@ -311,26 +375,23 @@ class LogEventHandler:
 
         try:
             # Check if department exists via departments/children API
-            r = httpx.get(
-                f"{self._bs_base}/api/v1/departments/children",
-                params={"parent_id": 1, "include_archived": "false"},
-                cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
-            children = r.json().get("data", {}).get("children", [])
+            r = self._pipeline._bs._get(
+                "/api/v1/departments/children",
+                params={"parent_id": 1, "include_archived": "false"}, timeout=15)
+            children = self._pipeline._bs.ok(r).get("data", {}).get("children", [])
             if any(d.get("name") == dept_name for d in children):
                 logger.debug(f"Dept already exists: {dept_name}")
                 return
 
             # Create department
-            r2 = httpx.post(
-                f"{self._bs_base}/api/v1/department",
-                json={"name": dept_name, "parent_id": 1},
-                cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
-            if r2.status_code == 200:
-                logger.info(f"Created department: {dept_name}")
-            else:
-                logger.warning(f"Create dept failed: {r2.text[:100]}")
+            r2 = self._pipeline._bs._post(
+                "/api/v1/department", {"name": dept_name, "parent_id": 1},
+                timeout=15)
+            self._pipeline._bs.ok(r2)
+            logger.info(f"Created department: {dept_name}")
         except Exception as e:
             logger.warning(f"Create dept error {dept_name}: {e}")
+            raise
 
     def _handle_user_dept_change(self, event: LogEvent):
         """OP6/OP7: User moved to/from department — update department membership in BISHENG.
@@ -352,22 +413,22 @@ class LogEventHandler:
 
         try:
             # Find user in BISHENG by external_id or display_name
-            r = httpx.get(
-                f"{self._bs_base}/api/v1/user/list",
+            r = self._pipeline._bs._get(
+                "/api/v1/user/list",
                 params={"keyword": display_name or username, "page": 1, "page_size": 10},
-                cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
-            users = r.json().get("data", {}).get("data", [])
+                timeout=15)
+            users = self._pipeline._bs.ok(r).get("data", {}).get("data", [])
             bs_user = next(
                 (u for u in users if u.get("external_id") == username
                  or u.get("user_name") == display_name),
                 None)
             if not bs_user:
                 # 再用 username 搜一次
-                r2 = httpx.get(
-                    f"{self._bs_base}/api/v1/user/list",
+                r2 = self._pipeline._bs._get(
+                    "/api/v1/user/list",
                     params={"keyword": username, "page": 1, "page_size": 5},
-                    cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
-                users2 = r2.json().get("data", {}).get("data", [])
+                    timeout=15)
+                users2 = self._pipeline._bs.ok(r2).get("data", {}).get("data", [])
                 bs_user = next(
                     (u for u in users2 if u.get("external_id") == username), None)
             if not bs_user:
@@ -381,15 +442,16 @@ class LogEventHandler:
                 return
 
             # Find target department ID in BISHENG
-            r2 = httpx.get(
-                f"{self._bs_base}/api/v1/departments/children",
-                params={"parent_id": 1, "include_archived": "false"},
-                cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
+            r2 = self._pipeline._bs._get(
+                "/api/v1/departments/children",
+                params={"parent_id": 1, "include_archived": "false"}, timeout=15)
+            dept_data = self._pipeline._bs.ok(r2)
             dept_id = None
-            for d in r2.json().get("data", {}).get("children", []):
+            for d in dept_data.get("data", {}).get("children", []):
                 if d.get("name") == target_dept:
                     dept_id = d.get("id")
                     break
+                found = _find_dept_node(d.get("children", []), target_dept)
                 if found:
                     dept_id = found
                     break
@@ -399,17 +461,14 @@ class LogEventHandler:
                 return
 
             # Update user's department
-            r3 = httpx.put(
-                f"{self._bs_base}/api/v1/user/{user_id}",
-                json={"department_id": dept_id},
-                cookies={"access_token_cookie": self._bs_cookie}, timeout=15)
-            if r3.status_code == 200:
-                logger.info(f"User {username} moved to dept {target_dept} (id={dept_id})")
-            else:
-                logger.warning(f"User dept update failed: {r3.text[:100]}")
+            r3 = self._pipeline._bs._put(
+                f"/api/v1/user/{user_id}", {"department_id": dept_id}, timeout=15)
+            self._pipeline._bs.ok(r3)
+            logger.info(f"User {username} moved to dept {target_dept} (id={dept_id})")
 
         except Exception as e:
             logger.warning(f"User dept change error {username}: {e}")
+            raise
 
     # ═══════════════════════════════════════════════════════════
     # Helpers

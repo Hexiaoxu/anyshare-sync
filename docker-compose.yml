@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # 增量同步守护进程（常驻）
   sync-daemon:

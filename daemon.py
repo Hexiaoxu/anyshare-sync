@@ -59,6 +59,7 @@ bs_cookie = generate_bs_token()
 
 pipeline = SyncPipeline(BS_BASE, bs_cookie, AS_BASE, console_token,
                         as_auth=auth, as_account=ADMIN_ACCOUNT)
+pipeline.restore_state()
 scheduler = LogSyncScheduler(pipeline, console_token, bs_cookie, interval=interval)
 
 if once_mode:

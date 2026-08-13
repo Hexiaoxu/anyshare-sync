@@ -25,7 +25,7 @@ def test_create_all_tables(engine):
         s.add(SyncSpaceMapping(source_doc_lib_id="gns://lib1", source_doc_lib_name="lib1", source_type="personal"))
         s.add(SyncFolderMapping(space_mapping_id=1, source_folder_id="gns://f1", source_name="f1"))
         s.add(SyncDocumentMapping(space_mapping_id=1, source_doc_id="gns://doc1", source_name="doc1"))
-        s.add(SyncScanRun())
+        s.add(SyncScanRun(scan_type="unit_test"))
         s.add(SyncTask(idempotency_key="abc123", action="transfer_create", source_doc_id="gns://doc1"))
         s.add(SyncPermissionSnapshot(resource_type="space", resource_id="1", source_acl_raw="{}"))
         s.add(SyncAuditEvent(trace_id="t1", action="scan", result="success"))

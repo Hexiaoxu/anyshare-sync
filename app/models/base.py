@@ -28,15 +28,6 @@ if _db_type == "dameng":
             local_code=1,      # UTF-8 (avoid GBK encoding errors)
         )
 
-    # Register schema on first connection
-    _schema_conn = _get_dm_conn()
-    schema_name = _db.get("schema", "")
-    if schema_name:
-        cur = _schema_conn.cursor()
-        cur.execute(f'SET SCHEMA "{schema_name}"')
-        cur.close()
-    _schema_conn.close()
-
     def _full_table(table_name: str) -> str:
         s = _db.get("schema", "")
         # Dameng is case-sensitive for quoted identifiers

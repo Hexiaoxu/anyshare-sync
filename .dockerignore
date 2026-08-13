@@ -1,0 +1,14 @@
+.git
+.idea
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+*.tar.gz
+*.zip
+*.xlsx
+data
+logs
+config/config.yaml
+users_import.json
+_dept_mapping.json

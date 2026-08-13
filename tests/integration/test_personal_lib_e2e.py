@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+import pytest
 
 sys.path.insert(0, ".")
 
@@ -40,11 +41,15 @@ logger = logging.getLogger("e2e-personal")
 # ============================================================
 # CONFIG — edit for your environment
 # ============================================================
-ANYSHARE_BASE = "https://5j-zsgl.powerchina.cn"
-ANYSHARE_TOKEN = "ory_at_RM7bAaE8zEeGAlbzehHMZDcvVSJLJhnVvjTXqd929U8.Y0UaOt-Nj3P-o1s69oNFuHPxlgLR18plRRE83ZhT-eM"
+ANYSHARE_BASE = os.environ.get("E2E_ANYSHARE_BASE", "")
+ANYSHARE_TOKEN = os.environ.get("E2E_ANYSHARE_TOKEN", "")
+BISHENG_BASE = os.environ.get("E2E_BISHENG_BASE", "")
+BISHENG_COOKIE_VALUE = os.environ.get("E2E_BISHENG_COOKIE", "")
 
-BISHENG_BASE = "http://192.168.106.161:7860"
-BISHENG_COOKIE_VALUE = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ7XCJ1c2VyX2lkXCI6IDEsIFwidXNlcl9uYW1lXCI6IFwiYWRtaW5cIiwgXCJ0ZW5hbnRfaWRcIjogMSwgXCJ0b2tlbl92ZXJzaW9uXCI6IDF9IiwiZXhwIjoxNzg0MTAxMDk4LCJpc3MiOiJiaXNoZW5nIn0.U3OsX2VeLKjKKoFyA4UkBQ91sy1VSU6zjE_mkrjpKpg"
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_REAL_E2E") != "1",
+    reason="real E2E disabled; set RUN_REAL_E2E=1 and E2E_* credentials",
+)
 
 # Max files to transfer in test (keep small for fast testing)
 MAX_TEST_FILES = 3
