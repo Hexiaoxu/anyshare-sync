@@ -28,7 +28,6 @@ users_import.json
 # Binary/archive files
 *.tar.gz
 *.zip
-drivers/
 
 # Local config with real credentials
 config/config.yaml
