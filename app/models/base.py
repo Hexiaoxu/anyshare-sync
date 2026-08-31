@@ -1,5 +1,6 @@
 """Database engine — SQLite (dev) or Dameng (prod), configured via config.yaml."""
 
+import os
 from pathlib import Path
 import yaml
 
@@ -11,7 +12,7 @@ def _load_db_config() -> dict:
     return cfg.get("database", {})
 
 _db = _load_db_config()
-_db_type = _db.get("type", "sqlite").lower()
+_db_type = os.environ.get("SYNC_DB_TYPE", _db.get("type", "sqlite")).lower()
 
 # ── Build engine ─────────────────────────────────────────────
 
@@ -38,7 +39,8 @@ if _db_type == "dameng":
 
 else:
     from sqlmodel import create_engine
-    sqlite_path = _db.get("sqlite_path", "data/sync_state.db")
+    sqlite_path = os.environ.get(
+        "SYNC_SQLITE_PATH", _db.get("sqlite_path", "data/sync_state.db"))
     db_path = Path(__file__).parent.parent.parent / sqlite_path
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(f"sqlite:///{db_path}", echo=False)

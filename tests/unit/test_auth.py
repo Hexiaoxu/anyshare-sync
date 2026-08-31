@@ -1,7 +1,11 @@
 """Unit tests for AnyShare auth module."""
 
 import pytest
+import httpx
+from unittest.mock import Mock
+
 from app.connectors.anyshare.auth import AnyShareAuth, Token
+from app.connectors.anyshare.exceptions import NetworkError
 from app.connectors.anyshare.mock import FakeAnyShareAuth
 
 
@@ -35,3 +39,28 @@ class TestFakeAuth:
         t1 = auth.get_app_token()
         t2 = auth.get_app_token()
         assert t1 == t2
+
+
+class TestAuthRetry:
+    def test_user_token_retries_transient_transport_error(self, monkeypatch):
+        monkeypatch.setattr("app.connectors.anyshare.auth.time.sleep", lambda _: None)
+        auth = AnyShareAuth("https://anyshare.example", "client", "secret")
+        auth._http = Mock()
+        auth._http.post.side_effect = [
+            httpx.ConnectError("temporary TLS failure"),
+            httpx.Response(200, json={"access_token": "user-token", "expires_in": 60}),
+        ]
+
+        assert auth.get_user_token("tester") == "user-token"
+        assert auth._http.post.call_count == 2
+
+    def test_app_token_fails_after_three_transport_errors(self, monkeypatch):
+        monkeypatch.setattr("app.connectors.anyshare.auth.time.sleep", lambda _: None)
+        auth = AnyShareAuth("https://anyshare.example", "client", "secret")
+        auth._http = Mock()
+        auth._http.post.side_effect = httpx.ReadTimeout("temporary timeout")
+
+        with pytest.raises(NetworkError, match="after 3 attempts"):
+            auth.get_app_token()
+
+        assert auth._http.post.call_count == 3

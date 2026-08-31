@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,14 +67,24 @@ class AnyShareDownloader:
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_path = dest_dir / info.name
 
-        with httpx.Client(timeout=httpx.Timeout(self._timeout)) as client:
-            with client.stream(info.http_method, info.url, headers=info.headers) as resp:
-                resp.raise_for_status()
-                actual_size = 0
-                with open(dest_path, "wb") as f:
-                    for chunk in resp.iter_bytes(self.CHUNK_SIZE):
-                        f.write(chunk)
-                        actual_size += len(chunk)
+        actual_size = 0
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=httpx.Timeout(self._timeout)) as client:
+                    with client.stream(info.http_method, info.url, headers=info.headers) as resp:
+                        resp.raise_for_status()
+                        actual_size = 0
+                        with open(dest_path, "wb") as f:
+                            for chunk in resp.iter_bytes(self.CHUNK_SIZE):
+                                f.write(chunk)
+                                actual_size += len(chunk)
+                break
+            except (httpx.ConnectError, httpx.RemoteProtocolError,
+                    httpx.ReadTimeout):
+                dest_path.unlink(missing_ok=True)
+                if attempt == 2:
+                    raise
+                time.sleep(3 * (attempt + 1))
 
         # Verify size
         if info.size > 0 and actual_size != info.size:

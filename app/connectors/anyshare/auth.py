@@ -78,8 +78,7 @@ class AnyShareAuth:
             try:
                 resp = self._http.post(url, data=data, headers=headers)
                 if resp.status_code in (502, 503, 429):
-                    import time as _t
-                    _t.sleep(5 * (attempt + 1))
+                    time.sleep(2 * (attempt + 1))
                     continue
                 self._raise_on_error(resp)
                 body = resp.json()
@@ -89,9 +88,18 @@ class AnyShareAuth:
                     token_type=body.get("token_type", "bearer"),
                     expires_at=time.time() + expires_in,
                 )
-            except httpx.TimeoutException:
-                raise NetworkError("Timeout fetching app token")
-        raise NetworkError("Auth server error: 502/503 after retries")
+            except httpx.TransportError as exc:
+                if attempt == 2:
+                    raise NetworkError(
+                        f"Transport error fetching app token after 3 attempts: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Transient error fetching app token (attempt %d/3): %s",
+                    attempt + 1,
+                    exc,
+                )
+                time.sleep(2 * (attempt + 1))
+        raise NetworkError("Auth server error: 429/502/503 after retries")
 
     # ── User Token ───────────────────────────────────────────
 
@@ -115,8 +123,7 @@ class AnyShareAuth:
             try:
                 resp = self._http.post(url, json=body, headers=headers)
                 if resp.status_code in (502, 503, 429):
-                    import time as _t
-                    _t.sleep(5 * (attempt + 1))
+                    time.sleep(2 * (attempt + 1))
                     continue
                 self._raise_on_error(resp)
                 data = resp.json()
@@ -126,9 +133,22 @@ class AnyShareAuth:
                     token_type=data.get("token_type", "bearer"),
                     expires_at=time.time() + expires_in,
                 )
-            except httpx.TimeoutException:
-                raise NetworkError(f"Timeout fetching user token for {account}")
-        raise NetworkError(f"Auth server error: 502/503 after retries for {account}")
+            except httpx.TransportError as exc:
+                if attempt == 2:
+                    raise NetworkError(
+                        f"Transport error fetching user token for {account} "
+                        f"after 3 attempts: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Transient error fetching user token for %s (attempt %d/3): %s",
+                    account,
+                    attempt + 1,
+                    exc,
+                )
+                time.sleep(2 * (attempt + 1))
+        raise NetworkError(
+            f"Auth server error: 429/502/503 after retries for {account}"
+        )
 
     # ── Helpers ──────────────────────────────────────────────
 

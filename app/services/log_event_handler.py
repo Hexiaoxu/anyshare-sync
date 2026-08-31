@@ -121,11 +121,11 @@ class LogEventHandler:
         """OP11: Re-fetch ACL and re-authorize."""
         gns = self._pipeline.resolve_uuid(event.obj_id)
         if not gns:
-            return
+            raise RuntimeError(f"Cannot resolve GNS for ACL event {event.obj_id}")
         bs_id = (self._pipeline._folder_map.get(gns) or
                  self._pipeline._file_map.get(gns))
         if not bs_id:
-            return
+            raise RuntimeError(f"Cannot resolve BISHENG resource for ACL event {event.obj_id}")
         res_type = "folder" if gns in self._pipeline._folder_map else "knowledge_file"
         grants = self._pipeline._build_grants_for_gns(gns)
         if grants:
@@ -145,8 +145,7 @@ class LogEventHandler:
         # Extract file name from exMsg or msg
         name = self._extract_filename(event)
         if not name:
-            logger.warning(f"Cannot extract filename from event: {event.msg[:80]}")
-            return
+            raise RuntimeError(f"Cannot extract filename from event: {event.msg[:80]}")
 
         # Find parent folder BISHENG ID
         parent_id = self._find_parent_bs_id(gns or "", event)
@@ -156,8 +155,7 @@ class LogEventHandler:
         if not space_id and gns:
             space_id = self._resolve_space_id_from_gns(gns)
         if not space_id:
-            logger.warning(f"Cannot resolve space_id for {name}, skipping")
-            return
+            raise RuntimeError(f"Cannot resolve space_id for {name}")
 
         # Checkpoint replay is expected after a partial failure. Create/copy
         # events reuse the persisted target and only retry authorization.
@@ -172,25 +170,32 @@ class LogEventHandler:
             logger.info("Reused existing file for replay: %s -> BS id=%s",
                         name[:50], existing_id)
             return
-        if existing_id and event.op_type in (4, 19):
-            self._pipeline._bs_file.delete_file(space_id, existing_id)
-            self._pipeline._file_map.pop(gns, None)
+        replacing_id = existing_id if existing_id and event.op_type in (4, 19) else None
 
         # docid for download
         docid = gns if gns else event.obj_id
 
         try:
             # Download
-            r = httpx.post(
-                f"{self._pipeline._as_base}/api/efast/v1/file/osdownload",
-                json={"docid": docid, "rev": "", "authtype": "QUERY_STRING",
-                      "savename": name, "usehttps": True},
-                headers={"Authorization": f"Bearer {self._pipeline._as_token}"},
-                timeout=30)
+            for attempt in range(3):
+                try:
+                    r = httpx.post(
+                        f"{self._pipeline._as_base}/api/efast/v1/file/osdownload",
+                        json={"docid": docid, "rev": "", "authtype": "QUERY_STRING",
+                              "savename": name, "usehttps": True},
+                        headers={"Authorization":
+                                 f"Bearer {self._pipeline._get_as_token()}"},
+                        timeout=30)
+                    r.raise_for_status()
+                    break
+                except httpx.TransportError:
+                    if attempt == 2:
+                        raise
+                    import time as time_mod
+                    time_mod.sleep(2 * (attempt + 1))
             auth_req = r.json().get("authrequest")
             if not auth_req:
-                logger.warning(f"No authrequest for {docid}: {r.text[:100]}")
-                return
+                raise RuntimeError(f"No authrequest for {docid}: {r.text[:100]}")
             headers = {}
             for h in auth_req[2:]:
                 if ": " in h:
@@ -202,12 +207,22 @@ class LogEventHandler:
             tmp.mkdir(parents=True, exist_ok=True)
             local = tmp / safe_name
 
-            with httpx.Client(timeout=120) as cc:
-                with cc.stream(auth_req[0], auth_req[1], headers=headers) as rr:
-                    rr.raise_for_status()
-                    with open(local, "wb") as fh:
-                        for chunk in rr.iter_bytes(65536):
-                            fh.write(chunk)
+            for attempt in range(3):
+                try:
+                    with httpx.Client(timeout=120) as cc:
+                        with cc.stream(auth_req[0], auth_req[1], headers=headers) as rr:
+                            rr.raise_for_status()
+                            with open(local, "wb") as fh:
+                                for chunk in rr.iter_bytes(65536):
+                                    fh.write(chunk)
+                    break
+                except (httpx.ConnectError, httpx.RemoteProtocolError,
+                        httpx.ReadTimeout):
+                    local.unlink(missing_ok=True)
+                    if attempt == 2:
+                        raise
+                    import time as time_mod
+                    time_mod.sleep(3 * (attempt + 1))
 
             # Upload + Register
             fp = self._pipeline._bs_file.upload_to_minio(space_id, local)
@@ -219,6 +234,11 @@ class LogEventHandler:
                 self._pipeline._uuid_to_gns[event.obj_id] = gns
                 self._pipeline.persist_event_mapping(
                     gns, fid, "knowledge_file", name=name, space_id=space_id)
+
+            # Replacement is committed only after the new file is registered
+            # and its persistent mapping is updated.
+            if replacing_id and replacing_id != fid:
+                self._pipeline._bs_file.delete_file(space_id, replacing_id)
 
             # Authorize
             if gns:
@@ -241,10 +261,11 @@ class LogEventHandler:
         """OP22: Create folder in BISHENG, matching AnyShare parent structure."""
         gns = self._pipeline.resolve_uuid(event.obj_id)
         if not gns:
-            logger.warning(f"UUID not found: {event.obj_id}")
-            return
+            raise RuntimeError(f"UUID not found: {event.obj_id}")
 
         name = self._extract_filename(event)
+        if not name:
+            raise RuntimeError(f"Cannot extract folder name from event: {event.msg[:80]}")
         parent_id = self._find_parent_bs_id(gns, event)
         space_id = self._resolve_space_id_from_gns(gns)
         if not space_id:
@@ -288,7 +309,7 @@ class LogEventHandler:
         """OP3/OP24: Delete file/folder from BISHENG and mark DB as deleted."""
         gns = self._pipeline.resolve_uuid(event.obj_id)
         if not gns:
-            return
+            raise RuntimeError(f"Cannot resolve GNS for delete event {event.obj_id}")
 
         is_folder = gns in self._pipeline._folder_map
         bs_id = (self._pipeline._folder_map.get(gns)
