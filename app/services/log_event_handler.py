@@ -99,17 +99,29 @@ class LogEventHandler:
     def handle(self, events: list[dict]) -> dict:
         self._stats = {a: 0 for a in EventAction}
         errors = 0
-        for entry in events:
+        for i, entry in enumerate(events):
             event = self._parse(entry)
             action = self._action_for(event)
+            logger.debug(
+                "event %d/%d: logType=%s opType=%s objId=%s user=%s action=%s",
+                i + 1, len(events), event.log_type, event.op_type,
+                event.obj_id, event.user_name, action.value)
             try:
                 handler = _HANDLERS.get(action)
                 if handler:
                     handler(self, event)
+                    logger.debug("event %d/%d: %s OK objId=%s",
+                                 i + 1, len(events), action.value, event.obj_id)
+                elif action == EventAction.IGNORE:
+                    logger.debug("event %d/%d: ignored (no-op opType) objId=%s",
+                                 i + 1, len(events), event.obj_id)
                 self._stats[action] += 1
             except Exception as e:
                 logger.warning(f"Handler error {action.value} {event.obj_id}: {e}")
                 errors += 1
+        logger.info("handle: %d event(s), %d error(s), stats=%s",
+                    len(events), errors,
+                    {k.value: v for k, v in self._stats.items() if v > 0})
         return {"stats": {k.value: v for k, v in self._stats.items() if v > 0},
                 "errors": errors}
 
@@ -128,19 +140,29 @@ class LogEventHandler:
             raise RuntimeError(f"Cannot resolve BISHENG resource for ACL event {event.obj_id}")
         res_type = "folder" if gns in self._pipeline._folder_map else "knowledge_file"
         grants = self._pipeline._build_grants_for_gns(gns)
-        if grants:
-            if not self._pipeline._bs_perm.authorize(
-                    res_type, bs_id, grants=grants, timeout=60, retries=2):
-                raise RuntimeError(f"BISHENG authorization failed for {res_type} {bs_id}")
+        if not grants:
+            logger.info("_handle_acl_change: no grants for %s bs_id=%s gns=%s "
+                       "(empty ACL or no download-allow entries) — no-op",
+                       res_type, bs_id, gns[-40:])
+            return
+        if not self._pipeline._bs_perm.authorize(
+                res_type, bs_id, grants=grants, timeout=60, retries=2):
+            raise RuntimeError(f"BISHENG authorization failed for {res_type} {bs_id}")
+        logger.info("_handle_acl_change: re-authorized %s bs_id=%s with %d grant(s)",
+                   res_type, bs_id, len(grants))
 
     def _handle_new_file(self, event: LogEvent):
         """OP2/OP19: Download from AnyShare → upload → register → authorize."""
         # Try GNS from UUID map first
         gns = self._pipeline.resolve_uuid(event.obj_id)
+        gns_source = "uuid_map" if gns else None
 
         # Fallback: construct GNS from exMsg parent path + UUID
         if not gns:
             gns = self._resolve_gns_from_ex_msg(event)
+            gns_source = "ex_msg" if gns else None
+        logger.debug("_handle_new_file: objId=%s gns=%s (source=%s)",
+                     event.obj_id, gns, gns_source or "unresolved")
 
         # Extract file name from exMsg or msg
         name = self._extract_filename(event)
@@ -149,12 +171,19 @@ class LogEventHandler:
 
         # Find parent folder BISHENG ID
         parent_id = self._find_parent_bs_id(gns or "", event)
+        if parent_id is None:
+            logger.warning(
+                "_handle_new_file: parent folder unresolved for %r (gns=%s) — "
+                "will land in the space root instead of its real folder",
+                name[:60], gns)
 
         # Resolve space_id from GNS or exMsg
         space_id = self._pipeline._space_id
         if not space_id and gns:
             space_id = self._resolve_space_id_from_gns(gns)
         if not space_id:
+            logger.warning("_handle_new_file: space_id unresolved for %r (gns=%s)",
+                           name[:60], gns)
             raise RuntimeError(f"Cannot resolve space_id for {name}")
 
         # Checkpoint replay is expected after a partial failure. Create/copy
@@ -261,14 +290,27 @@ class LogEventHandler:
         """OP22: Create folder in BISHENG, matching AnyShare parent structure."""
         gns = self._pipeline.resolve_uuid(event.obj_id)
         if not gns:
+            # Unlike _handle_new_file, there is no exMsg-based fallback here —
+            # a folder created after the last full/incremental scan (so its
+            # UUID was never restored into _uuid_to_gns) always fails this way.
+            logger.warning(
+                "_handle_new_folder: UUID not found in restored mappings: "
+                "objId=%s msg=%s — brand-new folders have no GNS fallback "
+                "and will always fail here", event.obj_id, event.msg[:100])
             raise RuntimeError(f"UUID not found: {event.obj_id}")
 
         name = self._extract_filename(event)
         if not name:
             raise RuntimeError(f"Cannot extract folder name from event: {event.msg[:80]}")
         parent_id = self._find_parent_bs_id(gns, event)
+        if parent_id is None:
+            logger.warning(
+                "_handle_new_folder: parent folder unresolved for %r (gns=%s) — "
+                "will land in the space root instead of its real parent",
+                name[:60], gns)
         space_id = self._resolve_space_id_from_gns(gns)
         if not space_id:
+            logger.warning("_handle_new_folder: space_id unresolved for gns=%s", gns)
             raise RuntimeError(f"Cannot resolve space_id for folder {gns}")
 
         existing_id = self._pipeline._folder_map.get(gns)
@@ -357,6 +399,8 @@ class LogEventHandler:
         """OP3/OP8 in LT11: Create/update user in BISHENG."""
         username, display_name = self._parse_user_from_msg(event.msg)
         if not username:
+            logger.warning("_handle_create_user: cannot parse username from msg: %r",
+                           event.msg[:100])
             return
 
         try:
@@ -392,6 +436,8 @@ class LogEventHandler:
         """
         dept_name = self._parse_dept_from_msg(event.msg)
         if not dept_name:
+            logger.warning("_handle_create_dept: cannot parse dept name from msg: %r",
+                           event.msg[:100])
             return
 
         try:
@@ -541,7 +587,10 @@ class LogEventHandler:
         # Try direct parent GNS from folder_map
         parent_gns = gns.rsplit("/", 1)[0] if "/" in gns else ""
         if parent_gns and parent_gns in self._pipeline._folder_map:
-            return self._pipeline._folder_map[parent_gns]
+            fid = self._pipeline._folder_map[parent_gns]
+            logger.debug("_find_parent_bs_id: direct hit via folder_map "
+                        "parent_gns=%s -> bs_id=%s", parent_gns[-40:], fid)
+            return fid
 
         # Fallback: parse parent path from exMsg
         # exMsg format: "...父路径: AnyShare://组织文档库/.../OA收文/filename; ..."
@@ -560,7 +609,21 @@ class LogEventHandler:
                 candidate = '/'.join(parts[:length])
                 fid = self._pipeline._bs_folder_by_path.get(candidate)
                 if fid:
+                    logger.debug(
+                        "_find_parent_bs_id: matched via exMsg path candidate=%r "
+                        "-> bs_id=%s", candidate, fid)
                     return fid
+            logger.warning(
+                "_find_parent_bs_id: no bs_folder_by_path match for exMsg "
+                "raw_path=%r (tried %d candidate(s)); note _bs_folder_by_path "
+                "keys are GNS UUID paths, not human-readable names — this "
+                "fallback only matches if candidate happens to equal a "
+                "stored GNS path", raw_path, len(parts))
+        else:
+            logger.warning(
+                "_find_parent_bs_id: parent_gns=%r not in folder_map and no "
+                "父路径/AnyShare:// pattern found in exMsg=%r",
+                parent_gns, ex[:150])
         return None
 
     def _resolve_space_id_from_gns(self, gns: str) -> int | None:
@@ -577,7 +640,14 @@ class LogEventHandler:
                     sm = s.exec(select(SyncSpaceMapping).where(
                         SyncSpaceMapping.source_doc_lib_id == candidate)).first()
                     if sm:
+                        logger.debug(
+                            "_resolve_space_id_from_gns: gns=%s matched lib "
+                            "candidate=%s -> space_id=%s",
+                            gns[-40:], candidate[-40:], sm.target_space_id)
                         return sm.target_space_id
+            logger.warning(
+                "_resolve_space_id_from_gns: no SyncSpaceMapping prefix matches "
+                "gns=%s (tried %d candidate(s))", gns, len(parts) - 1)
         except Exception as e:
             logger.warning(f"resolve_space_id error: {e}")
         return None
@@ -591,6 +661,9 @@ class LogEventHandler:
         ex = event.ex_msg
         m = re.search(r'父路径[:：]\s*AnyShare://([^;]+)', ex)
         if not m:
+            logger.warning(
+                "_resolve_gns_from_ex_msg: no 父路径/AnyShare:// pattern in "
+                "exMsg=%r (objId=%s)", ex[:150], event.obj_id)
             return None
 
         raw_path = m.group(1).strip()
@@ -610,11 +683,20 @@ class LogEventHandler:
                     parent_gns = sm.source_doc_lib_id
                     # If there are sub-folders in the path, append them
                     # (but we don't have their GNS, so just use lib root)
-                    return f"{parent_gns}/{event.obj_id}"
+                    gns = f"{parent_gns}/{event.obj_id}"
+                    logger.debug(
+                        "_resolve_gns_from_ex_msg: lib_name=%r matched -> gns=%s "
+                        "(note: placed directly under lib root — %d intermediate "
+                        "path segment(s) in raw_path=%r are NOT reflected in "
+                        "this gns, so nested objects will resolve the wrong "
+                        "parent folder)", lib_name, gns,
+                        max(0, len(path_parts) - 1), raw_path)
+                    return gns
         except Exception as e:
             logger.warning(f"resolve_gns_from_ex_msg error: {e}")
 
-        logger.warning(f"Cannot resolve parent GNS from path: {raw_path}")
+        logger.warning(f"Cannot resolve parent GNS from path: {raw_path} "
+                       f"(lib_name={lib_name!r} not found in SyncSpaceMapping)")
         return None
         """Construct file GNS from exMsg parent path + objId UUID.
 

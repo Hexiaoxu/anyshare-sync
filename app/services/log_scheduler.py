@@ -81,6 +81,13 @@ class LogSyncScheduler:
         from app.config import cfg as _cfg
         AS_BASE = _cfg.as_base
 
+        if not USER_ID:
+            logger.warning(
+                "anyshare.console_user_id is empty in config.yaml — "
+                "Console GetPageLog will likely return nothing or reject the "
+                "request; incremental sync cannot pull any events until this "
+                "is set to a valid AnyShare Console user id")
+
         # 刷新 token
         try:
             from app.connectors.anyshare.auth import AnyShareAuth
@@ -91,6 +98,8 @@ class LogSyncScheduler:
             logger.warning(f"Token refresh failed, using existing: {e}")
 
         for logType in [11, 12]:  # 11=组织, 12=文档 (10=登录 忽略)
+            type_count = 0
+            pages = 0
             start = 0
             while True:
                 body = [{'ncTGetPageLogParam': {
@@ -111,26 +120,35 @@ class LogSyncScheduler:
                         headers={'Authorization': f'Bearer {self._ct}',
                                  'Content-Type': 'application/json;charset=UTF-8'})
                     if r.status_code != 200:
-                        logger.warning(f"Log pull HTTP {r.status_code}: {r.text[:100]}")
+                        logger.warning(f"Log pull HTTP {r.status_code} "
+                                       f"(logType={logType} start={start}): {r.text[:200]}")
                         complete = False
                         break
                     data = r.json()
+                    pages += 1
                     if not data:
                         break
                     events.extend(data)
+                    type_count += len(data)
                     start += len(data)
                     if len(data) < 500:
                         break
                 except Exception as e:
-                    logger.error(f"Log pull error: {e}")
+                    logger.error(f"Log pull error (logType={logType} start={start}): {e}")
                     complete = False
                     break
+            logger.debug("Log pull logType=%s: %d event(s) across %d page(s)",
+                        logType, type_count, pages)
+        logger.info("Log pull done: %d event(s) total, complete=%s", len(events), complete)
         return events, complete
 
     # ── Main loop ──────────────────────────────────────────
 
     def run_once(self) -> dict:
         """Single incremental sync cycle."""
+        from app.logger import set_trace_id
+        set_trace_id()
+        logger.info("=== Incremental cycle start ===")
         since_us = self._load_checkpoint()
         if since_us == 0:
             # First run: set checkpoint to now, skip (need full sync first)

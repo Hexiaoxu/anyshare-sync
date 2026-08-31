@@ -94,6 +94,7 @@ class SyncPipeline:
 
     def restore_state(self) -> dict:
         """Restore persistent AnyShare → BISHENG mappings after a restart."""
+        logger.info("restore_state: loading persisted mappings from DB ...")
         init_db()
         folders = files = spaces = 0
         with get_session() as session:
@@ -116,14 +117,23 @@ class SyncPipeline:
                     self._uuid_to_gns[self._extract_uuid(gns)] = gns
                     self._gns_to_name[gns] = mapping.source_name
                     files += 1
-        logger.info("Restored mappings: %s spaces, %s folders, %s files",
-                    spaces, folders, files)
+        if spaces == 0 and folders == 0 and files == 0:
+            logger.warning(
+                "Restored mappings: 0 spaces, 0 folders, 0 files — incremental "
+                "sync will fail to resolve any existing object. Check that "
+                "database.type/schema matches the DB the full sync wrote to, "
+                "and that a full sync has actually run.")
+        else:
+            logger.info("Restored mappings: %s spaces, %s folders, %s files",
+                        spaces, folders, files)
         return {"spaces": spaces, "folders": folders, "files": files}
 
     def persist_event_mapping(self, gns: str, target_id: int,
                               resource_type: str, name: str = "",
                               space_id: int | None = None) -> bool:
         """Persist a mapping created by a log event immediately."""
+        logger.debug("persist_event_mapping: type=%s gns=%s target_id=%s name=%s",
+                     resource_type, gns, target_id, name[:40] if name else "")
         init_db()
         with get_session() as session:
             spaces = session.exec(select(SyncSpaceMapping)).all()
@@ -132,7 +142,10 @@ class SyncPipeline:
                 if gns == m.source_doc_lib_id or
                 gns.startswith(m.source_doc_lib_id.rstrip("/") + "/")), None)
             if not space:
-                logger.warning("Cannot persist event mapping without space: %s", gns)
+                logger.warning(
+                    "Cannot persist event mapping without space: gns=%s "
+                    "(no SyncSpaceMapping.source_doc_lib_id prefixes it — "
+                    "checked %d known spaces)", gns, len(spaces))
                 return False
             resolved_space_id = space_id or space.target_space_id
             if resource_type == "folder":
@@ -173,6 +186,8 @@ class SyncPipeline:
                         target_file_id=target_id, idempotency_key=key,
                         status="succeeded"))
             session.commit()
+        logger.info("persist_event_mapping OK: type=%s gns=%s -> target_id=%s space_id=%s",
+                    resource_type, gns[-40:], target_id, resolved_space_id)
         return True
 
     # ── Main entry ──────────────────────────────────────────
@@ -321,7 +336,14 @@ class SyncPipeline:
         """Resolve objId UUID to full GNS path."""
         if not hasattr(self, '_uuid_to_gns'):
             self._uuid_to_gns = {}
-        return self._uuid_to_gns.get(obj_id)
+        gns = self._uuid_to_gns.get(obj_id)
+        if gns:
+            logger.debug("resolve_uuid HIT: %s -> %s", obj_id, gns)
+        else:
+            logger.debug("resolve_uuid MISS: %s (known uuids=%d) — object never "
+                         "scanned/restored; will fall back to exMsg parsing",
+                         obj_id, len(self._uuid_to_gns))
+        return gns
 
     def sync_from_logs(self, console_token: str, since_date: int,
                        until_date: int) -> dict:
@@ -448,7 +470,13 @@ class SyncPipeline:
                 headers={"Authorization": f"Bearer {self._get_as_token()}"},
                 timeout=30)
             if r.status_code == 200:
-                return self._build_grants(r.json().get("perminfos", []))
+                perminfos = r.json().get("perminfos", [])
+                grants = self._build_grants(perminfos)
+                logger.debug("_build_grants_for_gns: gns=%s perminfos=%d -> grants=%d",
+                            gns[-40:], len(perminfos), len(grants))
+                return grants
+            logger.warning("_build_grants_for_gns: AnyShare perm2/get HTTP %s for %s",
+                           r.status_code, gns[-40:])
         except Exception as e:
             logger.warning(f"_build_grants_for_gns failed for {gns}: {e}")
         return []
