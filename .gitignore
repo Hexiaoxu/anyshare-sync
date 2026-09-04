@@ -31,3 +31,13 @@ users_import.json
 
 # Local config with real credentials
 config/config.yaml
+
+# Scratch/debug files from migration testing (not source)
+_*.txt
+_*.py
+diag_*.py
+diag_*.txt
+
+# Operation log / user export data (sensitive)
+*.csv
+*.bak

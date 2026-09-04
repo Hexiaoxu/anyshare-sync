@@ -37,7 +37,7 @@ class SyncPipeline:
 
     Usage:
         pipeline = SyncPipeline(
-            bs_base="http://192.168.106.161:3001",
+            bs_base="http://192.168.106.159:3001",
             bs_cookie="eyJ...",
             as_base="https://5j-zsgl.powerchina.cn",
             as_token="ory_at...",

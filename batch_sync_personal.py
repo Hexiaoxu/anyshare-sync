@@ -22,13 +22,11 @@ display_to_username = {u['display']: u['username'] for u in all_users}
 
 # 有内容的目标库（跳过空库和找不到username的）
 targets = [
-    ('系统测试用户', 'gns://110F8E071F0243AEBDB4DFD59F52D131'),
-    ('知识库测试',   'gns://E0AD7B49157A4D85AF4EA5FF32FC34A1'),
-    ('陈馨怡',      'gns://019FB4A45EC2437E8265B04097C2E4C1'),
-    ('雷皓楠',      'gns://726A9C8ABEAF436ABAE396D0643B285F'),
     ('刘远国',      'gns://793A217A71FB4119B0572CF90954FD55'),
+    ('雷皓楠',      'gns://726A9C8ABEAF436ABAE396D0643B285F'),
     ('谢秦雅风',    'gns://3B2049F789004B47937A3CA295A465A4'),
-    ('薛凯',        'gns://FAAB2ADB06AA4E1394336DEA377E1C94'),
+    ('系统测试用户', 'gns://110F8E071F0243AEBDB4DFD59F52D131'),
+    ('陈馨怡',      'gns://019FB4A45EC2437E8265B04097C2E4C1'),
 ]
 
 print(f'开始迁移 {len(targets)} 个个人库\n')

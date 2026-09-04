@@ -31,6 +31,7 @@ COPY sync_one_user.py ./
 COPY run.py        ./
 COPY discover.py   ./
 COPY migrate_all.py ./
+COPY generate_users_import.py ./
 
 # 创建必要目录（config 和 data 由外部挂载）
 RUN mkdir -p /app/logs /app/data /tmp/anyshare-sync

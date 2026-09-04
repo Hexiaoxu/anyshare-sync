@@ -15,6 +15,9 @@ from pathlib import Path
 from urllib.parse import quote
 sys.path.insert(0, '.')
 
+from app.logging_helpers import init_script_logging
+logger = init_script_logging("sync_dept_lib")
+
 # ── 配置 ──────────────────────────────────────────────────────
 import os as _os
 from app.config import cfg
@@ -33,7 +36,7 @@ DEPT_NAME = _os.environ.get("DEPT_NAME", "人力资源部")
 DEPT_GNS  = _os.environ.get("DEPT_GNS",
     "gns://0C9379F8E48545FEBE837679F3B4D9FA/11C780161B4D4F7BB9E227D6E332E37B"
     "/26FBA3F5DCAB467D9BB150C19FAFE75E/CB95075F74E34552B2D9577A338EDF87")
-AS_ACCOUNT = cfg.as_admin_account
+AS_ACCOUNT = _os.environ.get("AS_ACCOUNT", cfg.as_admin_account)
 
 # ── AS Token ──────────────────────────────────────────────────
 from app.connectors.anyshare.auth import AnyShareAuth
@@ -42,6 +45,24 @@ AS_TOKEN = auth.get_user_token(AS_ACCOUNT)
 as_headers = {'Authorization': f'Bearer {AS_TOKEN}'}
 bs_cookies = {'access_token_cookie': BROWSER_TOKEN}
 
+# 瞬态网络错误重试（AnyShare 偶发 "peer closed connection without sending complete
+# message body (incomplete chunked read)"，属网络抖动，重试即可）
+_RETRYABLE = (httpx.RemoteProtocolError, httpx.ConnectError,
+              httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+def _retry(fn, retries=3, delay=2.0, label=''):
+    """执行 fn()，遇到瞬态网络错误自动重试。"""
+    last = None
+    for i in range(retries):
+        try:
+            return fn()
+        except _RETRYABLE as e:
+            last = e
+            if i < retries - 1:
+                print(f'  [RETRY] {label} {type(e).__name__}: {e} (第 {i+2}/{retries} 次)', flush=True)
+                time.sleep(delay * (i + 1))
+    raise last
+
 print(f'=== 部门文档库迁移: {DEPT_NAME} ===')
 print(f'文件同步: {"开启" if SYNC_FILES else "关闭（只同步文件夹+权限）"}')
 print()
@@ -49,16 +70,16 @@ print()
 
 # ── 1. 复用已有空间，或创建新空间 ────────────────────────────
 print(f'[1/5] 准备 BISHENG 知识空间...')
-r = httpx.get(f'{BS_BASE}/api/v1/knowledge/space/mine', cookies=bs_cookies, timeout=10)
+r = _retry(lambda: httpx.get(f'{BS_BASE}/api/v1/knowledge/space/mine', cookies=bs_cookies, timeout=10), label='space/mine')
 existing = next((sp for sp in r.json().get('data', []) if sp.get('name') == DEPT_NAME), None)
 
 if existing:
     SP_ID = existing['id']
     print(f'  复用已有空间: {DEPT_NAME} (id={SP_ID})')
 else:
-    r = httpx.post(f'{BS_BASE}/api/v1/knowledge/space',
+    r = _retry(lambda: httpx.post(f'{BS_BASE}/api/v1/knowledge/space',
         json={'name': DEPT_NAME, 'description': f'AnyShare部门文档库 - {DEPT_NAME}', 'auth_type': 'public'},
-        cookies=bs_cookies, timeout=10)
+        cookies=bs_cookies, timeout=10), label='space create')
     SP_ID = r.json()['data']['id']
     print(f'  创建空间: {DEPT_NAME} (id={SP_ID})')
 
@@ -104,10 +125,14 @@ while queue:
     scanned.add(gns)
 
     enc = quote(gns, safe='')
+    # AnyShare sub_objects 的 limit 太小会静默截断：OA收文 有 2355 子目录+13 文件，
+    # 旧代码 limit=200 只扫到 200 个，其余 2000+ 全漏了。
+    # next_marker 翻页实测不可靠（marker 含 '+'，URL 编码后服务端不认、翻不动），
+    # 而 limit 上限约 9000（10000 会返回空）。故用 limit=5000 一次取全（含文件）。
     try:
-        r = httpx.get(
-            f'{AS_BASE}/api/efast/v1/folders/{enc}/sub_objects?limit=200&sort=name&direction=asc',
-            headers=as_headers, timeout=30)
+        r = _retry(lambda: httpx.get(
+            f'{AS_BASE}/api/efast/v1/folders/{enc}/sub_objects?limit=5000&sort=name&direction=asc',
+            headers=as_headers, timeout=30), label='sub_objects')
         if r.status_code != 200:
             print(f'  [WARN] {gns[:50]} -> {r.status_code}')
             continue
@@ -115,6 +140,9 @@ while queue:
     except Exception as e:
         print(f'  [ERR] scan {gns[:50]}: {e}')
         continue
+
+    if sub.get('next_marker'):
+        print(f'  [WARN] {gns[:50]} 子项超过 5000，仍可能被截断')
 
     for d in sub.get('dirs', []):
         all_dirs.append({'id': d['id'], 'name': d['name'],
@@ -126,7 +154,7 @@ while queue:
             all_files.append({'id': f['id'], 'name': f['name'],
                                'parent_gns': gns, 'size': f.get('size', 0)})
 
-    if (len(all_dirs) + len(all_files)) % 100 == 0:
+    if (len(all_dirs) + len(all_files)) % 500 == 0:
         print(f'  扫描中... {len(all_dirs)} 文件夹 / {len(all_files)} 文件', flush=True)
 
 print(f'  完成: {len(all_dirs)} 文件夹 / {len(all_files)} 文件')
@@ -137,22 +165,70 @@ print(f'\n[3/5] 创建 BISHENG 文件夹结构...')
 folder_map = {}  # AnyShare GNS -> BISHENG folder_id
 created_f = reused_f = failed_f = 0
 
-# 预加载已有文件夹（按 name 索引，用于复用）
 def load_bs_children(space_id, parent_id=None):
-    """Load existing BISHENG folders for a given parent."""
-    params = {'parent_id': parent_id} if parent_id else {}
-    r = httpx.get(f'{BS_BASE}/api/v1/knowledge/space/{space_id}/children',
-        params=params, cookies=bs_cookies, timeout=15)
-    if r.status_code == 200:
-        return {item['file_name']: item['id']
-                for item in r.json().get('data', {}).get('data', [])
-                if item.get('file_type') == 0}  # 0 = folder
-    return {}
+    """返回某个父目录下已存在的文件夹 {name: folder_id}。
 
-# 按深度排序（父节点先创建）
+    注意：BISHENG children API 默认 page_size=20（不传时只返回第一页 20 条），
+    必须显式传 page_size。实测 cursor 翻页在 page_size=100 时有重叠漏项 bug
+    （OA系统 200 个子目录用 100 翻页只拿回 196 个，漏 4 个 → 判「已存在」却复用
+    不到而失败）。因此用足够大的 page_size（500）一次拿全，避免触发有问题的
+    cursor 翻页；本迁移单目录最多 200 个子目录，500 足够。仍保留 cursor 作为
+    >500 子目录时的兜底（并打印告警）。
+    """
+    result = {}
+    cursor = None
+    while True:
+        params = {'page_size': 500}
+        if parent_id:
+            params['parent_id'] = parent_id
+        if cursor:
+            params['cursor'] = cursor
+        r = httpx.get(f'{BS_BASE}/api/v1/knowledge/space/{space_id}/children',
+            params=params, cookies=bs_cookies, timeout=20)
+        if r.status_code != 200:
+            break
+        data = r.json().get('data', {})
+        items = data.get('data', [])
+        if not isinstance(items, list) or not items:
+            break
+        for item in items:
+            if item.get('file_type') == 0:  # 0 = folder
+                result[item['file_name']] = item['id']
+        if not data.get('has_more'):
+            break
+        cursor = data.get('next_cursor')
+        if not cursor:
+            break
+        print(f'  [WARN] 目录子项超过 500，触发 cursor 翻页（可能漏项）: parent_id={parent_id}',
+              flush=True)
+    return result
+
+# 一次性递归构建整个空间已有文件夹的索引 {(parent_id, name): folder_id}，
+# 供后续按 (父目录, 名称) 精确复用。相比「先 create 撞 already exists 再查」，
+# 避免了父目录复用失败导致子目录级联失败的问题。
+def build_folder_index(space_id):
+    index = {}
+    queue = [None]  # None = 根
+    while queue:
+        pid = queue.pop(0)
+        for name, fid in load_bs_children(space_id, pid).items():
+            index[(pid, name)] = fid
+            queue.append(fid)
+    return index
+
+folder_index = build_folder_index(SP_ID)
+print(f'  已有 {len(folder_index)} 个文件夹可复用')
+
+# 按深度排序（父节点先处理），先查索引复用，查不到再创建
 for d in sorted(all_dirs, key=lambda x: x['depth']):
     parent_gns = d['parent_gns']
     parent_id  = folder_map.get(parent_gns)  # None = 根
+
+    fid = folder_index.get((parent_id, d['name']))
+    if fid:
+        folder_map[d['id']] = fid
+        reused_f += 1
+        continue
 
     try:
         r = httpx.post(f'{BS_BASE}/api/v1/knowledge/space/{SP_ID}/folders',
@@ -162,20 +238,10 @@ for d in sorted(all_dirs, key=lambda x: x['depth']):
         if resp.get('status_code') == 200:
             fid = resp['data']['id']
             folder_map[d['id']] = fid
+            folder_index[(parent_id, d['name'])] = fid
             created_f += 1
             if created_f % 50 == 0:
                 print(f'  已创建 {created_f} 个文件夹...', flush=True)
-        elif resp.get('status_code') == 18012 or 'already exists' in resp.get('status_message', '').lower():
-            # 文件夹已存在 — 查询并复用
-            existing = load_bs_children(SP_ID, parent_id)
-            fid = existing.get(d['name'])
-            if fid:
-                folder_map[d['id']] = fid
-                reused_f += 1
-            else:
-                failed_f += 1
-                if failed_f <= 3:
-                    print(f'  [FAIL] {d["name"]}: {resp.get("status_message","")[:60]}')
         else:
             failed_f += 1
             if failed_f <= 3:
@@ -274,8 +340,8 @@ needed_depts = set()
 
 for name, any_gns, bs_id, res_type in acl_items:
     try:
-        r = httpx.post(f'{AS_BASE}/api/eacp/v1/perm2/get',
-            json={'docid': any_gns}, headers=as_headers, timeout=10)
+        r = _retry(lambda: httpx.post(f'{AS_BASE}/api/eacp/v1/perm2/get',
+            json={'docid': any_gns}, headers=as_headers, timeout=10), label='perm2/get')
         if r.status_code == 200:
             perms = r.json().get('perminfos', [])
             acl_cache[any_gns] = perms
@@ -395,7 +461,7 @@ print(f'  权限同步: {synced}/{len(acl_items)} 项')
 # ── 完成 ─────────────────────────────────────────────────────
 print(f'\n=== 完成 ===')
 print(f'空间: {DEPT_NAME} (id={SP_ID})')
-print(f'文件夹: {created_f} 个')
+print(f'文件夹: {created_f + reused_f} 个（新建 {created_f} / 复用 {reused_f}）')
 print(f'文件: {"跳过" if not SYNC_FILES else f"{ok_f}/{len(all_files)}"}')
 print(f'权限: {synced}/{len(acl_items)} 项')
 print(f'查看: {BS_BASE} → 知识空间 → {DEPT_NAME}')

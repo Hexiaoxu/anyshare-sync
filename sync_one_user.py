@@ -12,6 +12,8 @@ LIB = sys.argv[3] if len(sys.argv) > 3 else input("AnyShare DocLib GNS: ").strip
 USER_NAME = sys.argv[4] if len(sys.argv) > 4 else input("User Name: ").strip()
 
 import sys as _sys; _sys.path.insert(0, '.')
+from app.logging_helpers import init_script_logging
+logger = init_script_logging("sync_one_user")
 from app.config import cfg
 AS_B = cfg.as_base
 BS_B = cfg.bs_base
@@ -30,7 +32,7 @@ else:
     print(f"  创建新空间: {USER_NAME}")
     r = httpx.post(f"{BS_B}/api/v1/knowledge/space",
         json={"name": USER_NAME, "description": "AnyShare个人文档库", "auth_type": "public"},
-        cookies={"access_token_cookie": BS})
+        cookies={"access_token_cookie": BS}, timeout=30)
     resp = r.json()
     data = resp.get("data", {})
     SP = data.get("id") or data.get("knowledge_id") or data.get("space_id")
@@ -104,7 +106,7 @@ for d in sorted(all_dirs, key=lambda x: x["id"].count("/")):  # parents first
     try:
         r = httpx.post(f"{BS_B}/api/v1/knowledge/space/{SP}/folders",
             json={"name": nm, "parent_id": parent_id},
-            cookies={"access_token_cookie": BS})
+            cookies={"access_token_cookie": BS}, timeout=30)
         if r.status_code == 200:
             fid = r.json()["data"]["id"]
             folder_map[d["id"]] = fid
@@ -146,7 +148,7 @@ for i, f in enumerate(all_files):
         with open(lp, "rb") as fh:
             r = httpx.post(f"{BS_B}/api/v1/knowledge/upload/{SP}",
                 files={"file": fh},
-                cookies={"access_token_cookie": BS})
+                cookies={"access_token_cookie": BS}, timeout=120)
         fp = r.json()["data"]["file_path"]
 
         # Register
@@ -159,7 +161,7 @@ for i, f in enumerate(all_files):
             pfid = folder_map.get(parent_gns)
         r = httpx.post(f"{BS_B}/api/v1/knowledge/space/{SP}/files",
             json={"file_path": [fp], "parent_id": pfid},
-            cookies={"access_token_cookie": BS})
+            cookies={"access_token_cookie": BS}, timeout=30)
         fid = r.json()["data"][0]["id"]
         file_id_map[did] = fid
         print(f"REG:{fid} STORED")
@@ -299,7 +301,7 @@ for display_name in needed_users:
     try:
         r = httpx.get(f"{BS_B}/api/v1/permissions/resources/knowledge_space/{SP}/grant-subjects/users",
             params={"keyword": display_name, "page": 1, "page_size": 5},
-            cookies={"access_token_cookie": BS})
+            cookies={"access_token_cookie": BS}, timeout=30)
         for u in r.json().get("data", []):
             if u["user_name"] == display_name:
                 bs_user_map[display_name] = (u["user_id"], "user")
@@ -315,7 +317,7 @@ for dept_name in needed_depts:
     try:
         r = httpx.get(f"{BS_B}/api/v1/permissions/resources/knowledge_space/{SP}/grant-subjects/departments/search",
             params={"keyword": dept_name, "limit": 5},
-            cookies={"access_token_cookie": BS})
+            cookies={"access_token_cookie": BS}, timeout=30)
         for root in r.json().get("data", {}).get("roots", []):
             def _find_matched(nodes, target):
                 for n in nodes:
@@ -409,4 +411,4 @@ for name, any_gns, bs_id, res_type in acl_items:
         print(f"  ACL ERR {name[:30]}: {str(e)[:80]}")
 
 print(f"\n=== DONE: Transfer={ok}/{len(all_files)}, ACL synced={synced_count}/{len(acl_items)} ===")
-print(f"View: http://192.168.106.161:3001 → {USER_NAME} (id={SP})")
+print(f"View: http://192.168.106.159:3001 → {USER_NAME} (id={SP})")

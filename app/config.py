@@ -17,6 +17,7 @@ class AnyShareConfig:
     client_id: str = ""
     client_secret: str = ""
     admin_account: str = ""
+    knowledge_account: str = ""
     console_user_id: str = ""
     timeout: float = 30.0
 
@@ -82,6 +83,7 @@ class AppConfig:
                 client_id=os.environ.get("ANYSHARE_CLIENT_ID", anyshare.get("client_id", "")),
                 client_secret=os.environ.get("ANYSHARE_CLIENT_SECRET", anyshare.get("client_secret", "")),
                 admin_account=anyshare.get("admin_account", ""),
+                knowledge_account=anyshare.get("knowledge_account", anyshare.get("admin_account", "")),
                 console_user_id=anyshare.get("console_user_id", ""),
                 timeout=anyshare.get("timeout", 30),
             ),
@@ -142,6 +144,10 @@ class _Cfg:
     @property
     def as_admin_account(self) -> str:
         return _load()["anyshare"]["admin_account"]
+
+    @property
+    def as_knowledge_account(self) -> str:
+        return _load()["anyshare"].get("knowledge_account") or _load()["anyshare"]["admin_account"]
 
     @property
     def as_console_user_id(self) -> str:

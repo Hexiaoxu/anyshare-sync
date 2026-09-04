@@ -14,6 +14,9 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.path.insert(0, '.')
 
+from app.logging_helpers import init_script_logging
+logger = init_script_logging("migrate_all")
+
 from app.config import cfg
 from app.connectors.anyshare.auth import AnyShareAuth
 from app.connectors.bisheng.token_generator import generate_bs_token
@@ -32,11 +35,13 @@ bs_token = generate_bs_token()
 
 results = {'ok': [], 'fail': []}
 
-def run_sync(dept_name: str, dept_gns: str, label: str = ''):
-    """运行 sync_dept_lib.py 迁移单个库"""
+def run_sync(dept_name: str, dept_gns: str, label: str = '', account: str = None):
+    """运行 sync_dept_lib.py 迁移单个库。account 为空时用 admin token。"""
     env = os.environ.copy()
     env['DEPT_NAME'] = dept_name
     env['DEPT_GNS']  = dept_gns
+    if account:
+        env['AS_ACCOUNT'] = account
     cmd = [sys.executable, 'sync_dept_lib.py']
     if with_files:
         cmd.append('--with-files')
@@ -63,7 +68,7 @@ if run_all or only_knowledge:
     if knowledge_items:
         print(f'── 知识库迁移（共 {len(knowledge_items)} 个）──')
         for item in knowledge_items:
-            run_sync(item['name'], item['gns'], '知识库')
+            run_sync(item['name'], item['gns'], '知识库', account=cfg.as_knowledge_account)
     else:
         print('[SKIP] config.yaml 中没有知识库配置，请先运行 discover.py')
 
@@ -134,9 +139,14 @@ if run_all or only_personal:
             owner_name = lib.get('owner_name', '')
             username = users_map.get(owner_name, '') or users_map.get(name, '')
 
+            if not username:
+                print(f'\n[个人库] {name} (owner={owner_name}): 无 username，跳过')
+                results['fail'].append(f'个人库/{name}')
+                continue
+
             env = os.environ.copy()
             cmd = [sys.executable, 'sync_one_user.py',
-                   auth.get_user_token(cfg.as_admin_account),
+                   auth.get_user_token(username),  # 必须用用户自己的 token，admin 无法访问他人个人库(404)
                    bs_token, gns, name]
             print(f'\n[个人库] {name} (owner={owner_name}, username={username})')
             r = subprocess.run(cmd, env=env, encoding='utf-8', errors='replace')

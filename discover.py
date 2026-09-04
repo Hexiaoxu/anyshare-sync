@@ -11,6 +11,9 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.path.insert(0, '.')
 
+from app.logging_helpers import init_script_logging
+logger = init_script_logging("discover")
+
 from app.config import cfg
 from app.connectors.anyshare.auth import AnyShareAuth
 from app.connectors.anyshare.doclib import AnyShareDocLib, DocLibType
@@ -99,17 +102,20 @@ if dry_run:
     print(yaml.dump({'sync': {'trees': trees}}, allow_unicode=True, default_flow_style=False))
     print(f'\n将写入 {personal_out}: {len(personal_data)} 条记录')
 else:
-    # 更新 config.yaml
-    with open(CONFIG_PATH, encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    config['sync']['trees'] = trees
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    print(f'\n✅ config.yaml trees 已更新')
-
-    # 保存个人库列表
+    # 先保存个人库列表（不依赖 config 写入，data/ 目录可写）
     with open(personal_out, 'w', encoding='utf-8') as f:
         json.dump(personal_data, f, ensure_ascii=False, indent=2)
-    print(f'✅ 个人库列表已保存到 {personal_out}')
+    print(f'\n✅ 个人库列表已保存到 {personal_out}')
+
+    # 更新 config.yaml（容器内 config 为只读挂载时，写入失败不影响上面结果）
+    try:
+        with open(CONFIG_PATH, encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        config['sync']['trees'] = trees
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        print('✅ config.yaml trees 已更新')
+    except Exception as e:
+        print(f'[WARN] config.yaml 更新失败（可能为只读挂载）: {e}')
 
 print('\n完成！接下来运行 migrate_all.py 开始迁移。')

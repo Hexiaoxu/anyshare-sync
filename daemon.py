@@ -17,19 +17,21 @@ os.chdir(Path(__file__).parent)
 sys.path.insert(0, '.')
 
 from app.config import cfg
+from app.logger import setup_logging, get_logger, set_trace_id
 
-# 日志配置
+# 统一日志体系（console + sync.log + error.log，带 trace_id），
+# 与 run.py / 增量子模块共用同一套，便于全量+增量在同一时间线调试。
+setup_logging(cfg.log_level)
+set_trace_id()
+
+# 额外保留 daemon.log（运维习惯：tail -f logs/daemon.log），追加到 root。
 log_dir = Path('logs')
 log_dir.mkdir(exist_ok=True)
-logging.basicConfig(
-    level=getattr(logging, cfg.log_level, logging.INFO),
-    format='%(asctime)s %(name)s: %(message)s',
-    handlers=[
-        logging.FileHandler('logs/daemon.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout),
-    ]
-)
-logger = logging.getLogger('daemon')
+_dh = logging.FileHandler('logs/daemon.log', encoding='utf-8')
+_dh.setFormatter(logging.Formatter('%(asctime)s %(name)s: %(message)s'))
+logging.getLogger().addHandler(_dh)
+
+logger = get_logger('daemon')
 
 # 从配置文件读取
 AS_BASE       = cfg.as_base

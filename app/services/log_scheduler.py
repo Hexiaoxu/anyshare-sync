@@ -90,7 +90,9 @@ class LogSyncScheduler:
         except Exception as e:
             logger.warning(f"Token refresh failed, using existing: {e}")
 
-        for logType in [11, 12]:  # 11=组织, 12=文档 (10=登录 忽略)
+        # 只同步文档操作(12)。组织(11)操作走 --sync-org 全量同步，
+        # 不在此处增量处理：组织日志的 msg 格式多样、解析不可靠，误处理会污染 BISHENG 用户/部门。
+        for logType in [12]:
             start = 0
             while True:
                 body = [{'ncTGetPageLogParam': {

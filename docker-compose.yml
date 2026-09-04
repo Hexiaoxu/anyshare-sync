@@ -11,6 +11,7 @@ services:
       - ./data:/app/data               # checkpoint 和数据库状态
       - ./logs:/app/logs               # 日志
       - /tmp/anyshare-sync:/tmp/anyshare-sync  # 临时文件
+      - ./users_import.json:/app/users_import.json:ro  # 用户名映射
     command: python3 daemon.py
 
   # 全量迁移（按需执行，用完自动退出）
@@ -28,3 +29,4 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - /tmp/anyshare-sync:/tmp/anyshare-sync
+      - ./users_import.json:/app/users_import.json:ro  # 用户名映射
