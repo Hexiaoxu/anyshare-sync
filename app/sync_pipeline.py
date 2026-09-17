@@ -293,7 +293,7 @@ class SyncPipeline:
                         logger.info(f"Ancestor folder: {name} (id={ancestor_parent})")
 
             # 2. Scan
-            all_dirs, all_files, skipped = self._scan(lib_gns)
+            all_dirs, all_files, skipped, scan_truncated = self._scan(lib_gns)
             logger.info(f"Scan: {len(all_dirs)} dirs, {len(all_files)} files"
                         + (f", {skipped} skipped" if skipped else ""))
 
@@ -327,7 +327,7 @@ class SyncPipeline:
             deletion_result = {"deleted": 0, "flagged": 0}
             if not force_recreate:
                 deletion_result = self._detect_and_delete_missing(
-                    lib_gns, all_dirs, all_files)
+                    lib_gns, all_dirs, all_files, scan_truncated)
 
             # 5. Write mapping tables
             scan_id = self._write_mappings(
@@ -537,8 +537,14 @@ class SyncPipeline:
 
     def _scan(self, lib_gns: str, max_depth: int | None = None,
               max_dirs: int | None = None,
-              max_files: int | None = None) -> tuple[list, list, int]:
-        """BFS scan with marker pagination. Returns (all_dirs, all_files, skipped_count)."""
+              max_files: int | None = None) -> tuple[list, list, int, bool]:
+        """BFS scan with marker pagination.
+
+        Returns (all_dirs, all_files, skipped_count, truncated). `truncated`
+        is True if max_depth or the dir/file count caps cut the scan short —
+        callers (deletion detection) need to know this, because a truncated
+        scan's absence of an object doesn't mean it was deleted in AnyShare.
+        """
         from app.config import cfg
         sync_cfg = cfg.sync
         max_depth = max_depth if max_depth is not None else int(sync_cfg.get("max_depth", 6))
@@ -547,6 +553,7 @@ class SyncPipeline:
         max_files = max_files if max_files is not None else int(sync_cfg.get("max_files_per_scan", max_objects))
         all_dirs, all_files = [], []
         skipped = 0
+        truncated = False
         # Ensure attributes exist (defensive against stale pyc)
         if not hasattr(self, '_uuid_to_gns'):
             self._uuid_to_gns = {}
@@ -565,6 +572,7 @@ class SyncPipeline:
 
             # Depth limit
             if depth > max_depth:
+                truncated = True
                 continue
 
             # Marker pagination
@@ -601,6 +609,7 @@ class SyncPipeline:
                 sub = r.json()
                 for d in sub.get("dirs", []):
                     if len(all_dirs) >= max_dirs:
+                        truncated = True
                         break
                     all_dirs.append(d)
                     # Map UUID -> GNS
@@ -609,6 +618,7 @@ class SyncPipeline:
                     queue.append((d["id"], gns, depth + 1))
                 for f in sub.get("files", []):
                     if len(all_files) >= max_files:
+                        truncated = True
                         break
                     if f.get("name", "").lower().endswith(tuple(SKIP_EXTENSIONS)):
                         skipped += 1
@@ -627,7 +637,12 @@ class SyncPipeline:
                 logger.warning(f"Scan limits reached: {max_dirs} dirs, {max_files} files")
                 break
 
-        return all_dirs, all_files, skipped
+        if truncated:
+            logger.warning(f"Scan of {lib_gns} was truncated (depth>{max_depth} skipped and/or "
+                           f"dir/file caps hit) — treating this run's results as incomplete "
+                           f"for deletion purposes")
+
+        return all_dirs, all_files, skipped, truncated
 
     def _filter_new_files(self, all_files: list,
                           lib_gns: str) -> tuple[list, int]:
@@ -879,19 +894,28 @@ class SyncPipeline:
         return scan_id
 
     def _detect_and_delete_missing(self, lib_gns: str, all_dirs: list,
-                                   all_files: list) -> dict:
+                                   all_files: list,
+                                   scan_truncated: bool = False) -> dict:
         """Compare previously-known mappings (from restore_state()) for this
         scope against this scan's results. Anything known but no longer
-        found has presumably been deleted in AnyShare — after `missing_count`
-        reaches `sync.missing_threshold` (default 2) consecutive scans, hard
-        delete it from BISHENG and soft-delete the mapping row.
+        found has presumably been deleted in AnyShare.
 
-        The threshold debounces a single incomplete/failed scan from being
-        mistaken for a mass deletion. A resource that reappears in a later
-        scan has its missing_count reset to 0 by _write_mappings().
+        _scan() walks the whole tree (paginated, not a partial listing) and
+        either completes or raises — so if we get here with scan_truncated
+        False, "missing from this scan" already means "AnyShare doesn't have
+        it", and there's no reason to wait for a second scan to confirm it.
+        So: delete on the first miss for a complete scan. Only fall back to
+        waiting for `sync.missing_threshold` (default 2) consecutive misses
+        when the scan itself was truncated (hit max_depth or the dir/file
+        caps) — there, "missing from this scan" could just mean "the scan
+        didn't reach it", and a second, independent scan reaching the same
+        conclusion is what makes it trustworthy.
+
+        A resource that reappears in a later scan has its missing_count
+        reset to 0 by _write_mappings().
         """
         from app.config import cfg
-        threshold = max(1, int(cfg.sync.get("missing_threshold", 2)))
+        threshold = 1 if not scan_truncated else max(1, int(cfg.sync.get("missing_threshold", 2)))
 
         prefix = lib_gns.rstrip("/") + "/"
         def _in_scope(gns: str) -> bool:
