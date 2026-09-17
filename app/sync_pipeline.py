@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 SKIP_EXTENSIONS = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".iso"}
 
 
+def _rss_mb() -> str:
+    """Current process peak RSS in MB, for diagnosing OOM-kill-before-traceback cases."""
+    try:
+        import resource
+        kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return f"{kb / 1024:.0f}MB"
+    except Exception:
+        return "?"
+
+
 class SyncPipeline:
     """Runs full migration for one AnyShare doc lib → BISHENG space.
 
@@ -94,13 +104,25 @@ class SyncPipeline:
 
     def restore_state(self) -> dict:
         """Restore persistent AnyShare → BISHENG mappings after a restart."""
+        logger.info("[restore_state] init_db() ... rss=%s", _rss_mb())
         init_db()
+        logger.info("[restore_state] init_db() done, opening session ... rss=%s", _rss_mb())
         folders = files = spaces = 0
         with get_session() as session:
-            for mapping in session.exec(select(SyncSpaceMapping)).all():
+            logger.info("[restore_state] session open, querying SyncSpaceMapping ... rss=%s", _rss_mb())
+            rows = session.exec(select(SyncSpaceMapping)).all()
+            logger.info("[restore_state] SyncSpaceMapping fetched: %s rows, rss=%s", len(rows), _rss_mb())
+            for mapping in rows:
                 if mapping.target_space_id:
                     spaces += 1
-            for mapping in session.exec(select(SyncFolderMapping)).all():
+
+            logger.info("[restore_state] querying SyncFolderMapping ... rss=%s", _rss_mb())
+            rows = session.exec(select(SyncFolderMapping)).all()
+            logger.info("[restore_state] SyncFolderMapping fetched: %s rows, rss=%s", len(rows), _rss_mb())
+            for i, mapping in enumerate(rows):
+                if i and i % 20000 == 0:
+                    logger.info("[restore_state] folder mapping build progress: %s/%s rss=%s",
+                                i, len(rows), _rss_mb())
                 if mapping.target_folder_id and mapping.status != "deleted":
                     gns = mapping.source_folder_id
                     self._folder_map[gns] = mapping.target_folder_id
@@ -109,15 +131,24 @@ class SyncPipeline:
                     if mapping.source_path:
                         self._bs_folder_by_path[mapping.source_path] = mapping.target_folder_id
                     folders += 1
-            for mapping in session.exec(select(SyncDocumentMapping)).all():
+            logger.info("[restore_state] folder mapping build done: %s active, rss=%s", folders, _rss_mb())
+
+            logger.info("[restore_state] querying SyncDocumentMapping ... rss=%s", _rss_mb())
+            rows = session.exec(select(SyncDocumentMapping)).all()
+            logger.info("[restore_state] SyncDocumentMapping fetched: %s rows, rss=%s", len(rows), _rss_mb())
+            for i, mapping in enumerate(rows):
+                if i and i % 20000 == 0:
+                    logger.info("[restore_state] document mapping build progress: %s/%s rss=%s",
+                                i, len(rows), _rss_mb())
                 if mapping.target_file_id and mapping.status != "deleted":
                     gns = mapping.source_doc_id
                     self._file_map[gns] = mapping.target_file_id
                     self._uuid_to_gns[self._extract_uuid(gns)] = gns
                     self._gns_to_name[gns] = mapping.source_name
                     files += 1
-        logger.info("Restored mappings: %s spaces, %s folders, %s files",
-                    spaces, folders, files)
+            logger.info("[restore_state] document mapping build done: %s active, rss=%s", files, _rss_mb())
+        logger.info("Restored mappings: %s spaces, %s folders, %s files, rss=%s",
+                    spaces, folders, files, _rss_mb())
         return {"spaces": spaces, "folders": folders, "files": files}
 
     def persist_event_mapping(self, gns: str, target_id: int,
