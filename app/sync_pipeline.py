@@ -1033,9 +1033,12 @@ class SyncPipeline:
                 acl_items.append((fid, "knowledge_file", f["name"], f["id"]))
 
         synced = 0
+        unresolved_grants = 0   # eligible ACL entries whose accessor never resolved
+        incomplete_resources = 0  # resources where every eligible entry failed to resolve
         for bs_id, res_type, name, gns in acl_items:
             perms = acl_cache.get(gns, [])
             grants = []
+            eligible = 0  # allow+no-deny entries, before principal resolution
             for p in perms:
                 allows = set(p.get("allow", []))
                 denys = set(p.get("deny", []))
@@ -1044,6 +1047,7 @@ class SyncPipeline:
                 rel = _translate_relation(allows)
                 if rel is None:
                     continue
+                eligible += 1
 
                 atype = p.get("accessortype", "user")
                 aname = p.get("accessorname", "")
@@ -1053,12 +1057,31 @@ class SyncPipeline:
                         grants.append({"subject_type": "department",
                                        "subject_id": did, "relation": rel,
                                        "include_children": False})
+                    else:
+                        unresolved_grants += 1
                 else:
                     uname, dname = parse_accessorname(aname)
                     uid = self._mapper.resolve_principal(dname or uname, "user")
                     if uid:
                         grants.append({"subject_type": "user",
                                        "subject_id": uid, "relation": rel})
+                    else:
+                        unresolved_grants += 1
+
+            # An "eligible" ACL entry (allow+no-deny) that resolved to zero
+            # grants means the resource ends up with NO actual permissions
+            # applied even though the source ACL intended someone to have
+            # access — silently swallowing this looks identical in the
+            # synced/total count to "this resource legitimately has no ACL",
+            # which is how a customer ended up with transferred-but-invisible
+            # files. Surface it loudly instead.
+            if eligible and not grants:
+                incomplete_resources += 1
+                logger.warning(
+                    f"  {res_type} {name[:35]}: {eligible} ACL entr"
+                    f"{'y' if eligible == 1 else 'ies'} could not be resolved "
+                    f"to a BISHENG user/department — 0 grants applied, nobody "
+                    f"got access to this resource")
 
             # grants may legitimately be empty here (AnyShare access fully
             # revoked) — still go through authorize_with_revoke so a prior
@@ -1068,6 +1091,13 @@ class SyncPipeline:
                 synced += 1
             else:
                 logger.warning(f"  {res_type} {name[:35]}: FAIL")
+
+        if unresolved_grants:
+            logger.warning(
+                f"ACL sync: {unresolved_grants} grant(s) skipped — accessor "
+                f"could not be resolved to a BISHENG user/department "
+                f"({incomplete_resources} resource(s) ended up with zero "
+                f"grants as a result; see warnings above for which)")
 
         return synced, len(acl_items)
 
