@@ -1,6 +1,7 @@
 services:
   # 增量同步守护进程（常驻）
   sync-daemon:
+    build: .
     image: anyshare-sync:latest
     container_name: anyshare-sync-daemon
     restart: unless-stopped
@@ -17,6 +18,7 @@ services:
   # 全量迁移（按需执行，用完自动退出）
   # 示例：docker compose run --rm sync-job python3 import_org.py
   sync-job:
+    build: .
     image: anyshare-sync:latest
     container_name: anyshare-sync-job
     profiles: ["job"]                  # 不随 up 自动启动
