@@ -320,6 +320,15 @@ class SyncPipeline:
                     preserve_existing=not force_recreate)
                 logger.info(f"Transfer: {ok}/{len(transfer_files)} OK, {ng} failed")
 
+            # 4b. Detect files/folders deleted in AnyShare since the last
+            # scan and remove them from BISHENG too (debounced by
+            # missing_threshold). N/A for force_recreate — the space was
+            # just wiped, so nothing "missing" can exist yet.
+            deletion_result = {"deleted": 0, "flagged": 0}
+            if not force_recreate:
+                deletion_result = self._detect_and_delete_missing(
+                    lib_gns, all_dirs, all_files)
+
             # 5. Write mapping tables
             scan_id = self._write_mappings(
                 lib_gns, space_name, source_type, all_dirs, all_files,
@@ -340,12 +349,15 @@ class SyncPipeline:
                 "failed": ng,
                 "skipped_archives": skipped,
                 "acl_synced": f"{synced}/{total}",
+                "deleted": deletion_result["deleted"],
+                "deletion_flagged": deletion_result["flagged"],
                 "elapsed_sec": elapsed,
                 "scan_id": scan_id,
             }
             logger.info(f"=== Sync done ({elapsed:.0f}s): "
                          f"{len(all_dirs)}D/{len(all_files)}F, "
-                         f"xfer={ok}/{len(all_files)}, ACL={synced}/{total} ===")
+                         f"xfer={ok}/{len(all_files)}, ACL={synced}/{total}, "
+                         f"del={deletion_result['deleted']} ===")
             return result
 
         except Exception:
@@ -831,6 +843,7 @@ class SyncPipeline:
                     existing.last_seen_scan_id = scan_id
                     existing.source_size = f.get("size", 0)
                     existing.source_name = f["name"]
+                    existing.missing_count = 0
                     if target_id:
                         existing.source_rev = f.get("rev", "")
                         existing.content_version = f.get("rev", "")
@@ -864,6 +877,87 @@ class SyncPipeline:
             s.commit()
 
         return scan_id
+
+    def _detect_and_delete_missing(self, lib_gns: str, all_dirs: list,
+                                   all_files: list) -> dict:
+        """Compare previously-known mappings (from restore_state()) for this
+        scope against this scan's results. Anything known but no longer
+        found has presumably been deleted in AnyShare — after `missing_count`
+        reaches `sync.missing_threshold` (default 2) consecutive scans, hard
+        delete it from BISHENG and soft-delete the mapping row.
+
+        The threshold debounces a single incomplete/failed scan from being
+        mistaken for a mass deletion. A resource that reappears in a later
+        scan has its missing_count reset to 0 by _write_mappings().
+        """
+        from app.config import cfg
+        threshold = max(1, int(cfg.sync.get("missing_threshold", 2)))
+
+        prefix = lib_gns.rstrip("/") + "/"
+        def _in_scope(gns: str) -> bool:
+            return gns == lib_gns or gns.startswith(prefix)
+
+        scanned_folder_gns = {d["id"] for d in all_dirs}
+        scanned_file_gns = {f["id"] for f in all_files}
+        missing_folders = [g for g in self._folder_map
+                           if _in_scope(g) and g not in scanned_folder_gns]
+        missing_files = [g for g in self._file_map
+                         if _in_scope(g) and g not in scanned_file_gns]
+
+        deleted, flagged = 0, 0
+        init_db()
+        with get_session() as s:
+            for gns in missing_files:
+                m = s.exec(select(SyncDocumentMapping).where(
+                    SyncDocumentMapping.source_doc_id == gns)).first()
+                if not m or m.status == "deleted":
+                    continue
+                m.missing_count = (m.missing_count or 0) + 1
+                if m.missing_count >= threshold:
+                    bs_id = self._file_map.get(gns)
+                    try:
+                        if bs_id:
+                            self._bs_file.delete_file(self._space_id, bs_id)
+                        m.status = "deleted"
+                        self._file_map.pop(gns, None)
+                        deleted += 1
+                        logger.info(f"Deleted file (missing {m.missing_count}x "
+                                    f"from source): {m.source_name}")
+                    except Exception as e:
+                        logger.warning(f"Delete failed for file {m.source_name}: {e}")
+                else:
+                    flagged += 1
+                s.add(m)
+            s.commit()
+
+            for gns in missing_folders:
+                m = s.exec(select(SyncFolderMapping).where(
+                    SyncFolderMapping.source_folder_id == gns)).first()
+                if not m or m.status == "deleted":
+                    continue
+                m.missing_count = (m.missing_count or 0) + 1
+                if m.missing_count >= threshold:
+                    bs_id = self._folder_map.get(gns)
+                    try:
+                        if bs_id:
+                            self._bs_folder.delete(
+                                m.target_space_id or self._space_id, bs_id)
+                        m.status = "deleted"
+                        self._folder_map.pop(gns, None)
+                        deleted += 1
+                        logger.info(f"Deleted folder (missing {m.missing_count}x "
+                                    f"from source): {m.source_name}")
+                    except Exception as e:
+                        logger.warning(f"Delete failed for folder {m.source_name}: {e}")
+                else:
+                    flagged += 1
+                s.add(m)
+            s.commit()
+
+        if deleted or flagged:
+            logger.info(f"Deletion scan: {deleted} deleted, {flagged} flagged "
+                        f"(below threshold={threshold})")
+        return {"deleted": deleted, "flagged": flagged}
 
     def _sync_permissions(self, all_dirs: list, all_files: list,
                           lib_gns: str, ancestor_parent: int | None,
@@ -941,8 +1035,6 @@ class SyncPipeline:
         synced = 0
         for bs_id, res_type, name, gns in acl_items:
             perms = acl_cache.get(gns, [])
-            if not perms:
-                continue
             grants = []
             for p in perms:
                 allows = set(p.get("allow", []))
@@ -968,38 +1060,99 @@ class SyncPipeline:
                         grants.append({"subject_type": "user",
                                        "subject_id": uid, "relation": rel})
 
-            if not grants:
-                continue
-
-            ok = self._bs_perm.authorize(res_type, bs_id, grants=grants,
-                                         timeout=60, retries=2)
+            # grants may legitimately be empty here (AnyShare access fully
+            # revoked) — still go through authorize_with_revoke so a prior
+            # grant gets revoked in BISHENG instead of silently lingering.
+            ok = self.authorize_with_revoke(res_type, bs_id, name, gns, grants)
             if ok:
                 synced += 1
-                logger.debug(f"  {res_type} {name[:35]}: {len(grants)} grants OK")
-                # Write permission snapshot
-                self._save_perm_snapshot(res_type, bs_id, name, gns, grants)
             else:
                 logger.warning(f"  {res_type} {name[:35]}: FAIL")
 
         return synced, len(acl_items)
 
-    def _save_perm_snapshot(self, res_type: str, bs_id: int,
-                            name: str, gns: str, grants: list):
-        """Write a SyncPermissionSnapshot record for audit trail."""
+    # ── Permission revocation ────────────────────────────────
+    #
+    # BISHENG's authorize() API accepts both grants and revokes in one call,
+    # but the ACL we get from AnyShare only ever tells us the CURRENT allowed
+    # set — never what was removed. So a user/department dropped from an
+    # AnyShare ACL would otherwise keep stale access in BISHENG forever.
+    # We diff against the grants we last applied (stored in
+    # SyncPermissionSnapshot, upserted per resource) to compute what to
+    # revoke this round.
+
+    def authorize_with_revoke(self, res_type: str, bs_id: int, name: str,
+                              gns: str, grants: list[dict],
+                              timeout: float = 60, retries: int = 2) -> bool:
+        """authorize() wrapper that also revokes anything granted last time
+        but missing from `grants` now, then updates the snapshot used for
+        the next diff. Safe to call with an empty `grants` list (full
+        revocation)."""
+        old_grants = self._load_previous_grants(res_type, bs_id)
+        revokes = self._diff_revokes(old_grants, grants)
+        if not grants and not revokes:
+            return True  # nothing to do, and nothing was ever granted
+        ok = self._bs_perm.authorize(res_type, bs_id, grants=grants,
+                                     revokes=revokes, timeout=timeout,
+                                     retries=retries)
+        if ok:
+            if revokes:
+                logger.info(f"  {res_type} {name[:35]}: {len(grants)} grants, "
+                            f"{len(revokes)} revoked")
+            else:
+                logger.debug(f"  {res_type} {name[:35]}: {len(grants)} grants OK")
+            self._save_perm_snapshot(res_type, bs_id, name, gns, grants)
+        return ok
+
+    @staticmethod
+    def _diff_revokes(old_grants: list[dict], new_grants: list[dict]) -> list[dict]:
+        """Grants present in `old_grants` but not `new_grants` (by subject+relation)."""
+        new_keys = {(g.get("subject_type"), g.get("subject_id"), g.get("relation"))
+                    for g in new_grants}
+        return [{"subject_type": g["subject_type"], "subject_id": g["subject_id"],
+                 "relation": g["relation"]}
+                for g in old_grants
+                if (g.get("subject_type"), g.get("subject_id"), g.get("relation"))
+                not in new_keys]
+
+    def _load_previous_grants(self, res_type: str, bs_id: int) -> list[dict]:
+        """Grants applied last time we wrote this resource's snapshot."""
         try:
             from app.models.permission_snapshot import SyncPermissionSnapshot
-            from app.models import get_session
             import json
+            resource_id = f"{res_type}/{bs_id}"
             with get_session() as s:
-                snap = SyncPermissionSnapshot(
-                    tenant_id=1,
-                    resource_type=res_type,
-                    resource_id=f"{res_type}/{bs_id}",
-                    source_acl_raw=json.dumps(
-                        {"gns": gns, "name": name}, ensure_ascii=False),
-                    target_fga_tuples=json.dumps(grants, ensure_ascii=False),
-                    is_blocked=False,
-                )
+                snap = s.exec(select(SyncPermissionSnapshot).where(
+                    SyncPermissionSnapshot.resource_id == resource_id)).first()
+                if snap and snap.target_fga_tuples:
+                    return json.loads(snap.target_fga_tuples)
+        except Exception as e:
+            logger.debug(f"Snapshot read failed: {e}")
+        return []
+
+    def _save_perm_snapshot(self, res_type: str, bs_id: int,
+                            name: str, gns: str, grants: list):
+        """Upsert the SyncPermissionSnapshot record for this resource — one
+        row per resource (not one per run), so it reflects the currently
+        applied grants and can be diffed against next time."""
+        try:
+            from app.models.permission_snapshot import SyncPermissionSnapshot
+            import json
+            resource_id = f"{res_type}/{bs_id}"
+            raw = json.dumps({"gns": gns, "name": name}, ensure_ascii=False)
+            payload = json.dumps(grants, ensure_ascii=False)
+            with get_session() as s:
+                snap = s.exec(select(SyncPermissionSnapshot).where(
+                    SyncPermissionSnapshot.resource_id == resource_id)).first()
+                if snap:
+                    snap.source_acl_raw = raw
+                    snap.target_fga_tuples = payload
+                    snap.is_blocked = False
+                else:
+                    snap = SyncPermissionSnapshot(
+                        tenant_id=1, resource_type=res_type,
+                        resource_id=resource_id, source_acl_raw=raw,
+                        target_fga_tuples=payload, is_blocked=False)
                 s.add(snap)
                 s.commit()
         except Exception as e:

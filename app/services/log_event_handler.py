@@ -188,8 +188,8 @@ class LogEventHandler:
             logger.info("ACL fallback: found %s %r -> BS id=%s",
                         t.res_type, t.name[:40], bs_id)
         grants = self._pipeline._build_grants_for_gns(t.gns)
-        if grants and not self._pipeline._bs_perm.authorize(
-                t.res_type, bs_id, grants=grants, timeout=60, retries=2):
+        if not self._pipeline.authorize_with_revoke(
+                t.res_type, bs_id, t.name, t.gns, grants, timeout=60, retries=2):
             raise RuntimeError(f"BISHENG authorization failed for {t.res_type} {bs_id}")
 
     def _handle_new_folder(self, event: LogEvent):
@@ -204,8 +204,8 @@ class LogEventHandler:
         existing_id = self._pipeline._folder_map.get(t.gns)
         if existing_id:
             grants = self._pipeline._build_grants_for_gns(t.gns)
-            if grants and not self._pipeline._bs_perm.authorize(
-                    "folder", existing_id, grants=grants, timeout=60, retries=2):
+            if not self._pipeline.authorize_with_revoke(
+                    "folder", existing_id, t.name, t.gns, grants, timeout=60, retries=2):
                 raise RuntimeError(
                     f"BISHENG authorization failed for folder {existing_id}")
             logger.info("Reused existing folder for replay: %s -> BS id=%s",
@@ -220,8 +220,8 @@ class LogEventHandler:
             t.gns, fid, "folder", name=t.name, space_id=space_id)
 
         grants = self._pipeline._build_grants_for_gns(t.gns)
-        if grants and not self._pipeline._bs_perm.authorize(
-                "folder", fid, grants=grants, timeout=60, retries=2):
+        if not self._pipeline.authorize_with_revoke(
+                "folder", fid, t.name, t.gns, grants, timeout=60, retries=2):
             raise RuntimeError(f"BISHENG authorization failed for folder {fid}")
         logger.info(f"Synced new folder: {t.name[:40]} -> BS id={fid}")
 
@@ -240,8 +240,8 @@ class LogEventHandler:
         existing_id = self._pipeline._file_map.get(t.gns)
         if existing_id and event.op_type in (2, 24):
             grants = self._pipeline._build_grants_for_gns(t.gns)
-            if grants and not self._pipeline._bs_perm.authorize(
-                    "knowledge_file", existing_id, grants=grants,
+            if not self._pipeline.authorize_with_revoke(
+                    "knowledge_file", existing_id, t.name, t.gns, grants,
                     timeout=60, retries=2):
                 raise RuntimeError(
                     f"BISHENG authorization failed for file {existing_id}")
@@ -266,8 +266,8 @@ class LogEventHandler:
                 self._pipeline._bs_file.delete_file(space_id, replacing_id)
 
             grants = self._pipeline._build_grants_for_gns(t.gns)
-            if grants and not self._pipeline._bs_perm.authorize(
-                    "knowledge_file", fid, grants=grants, timeout=60, retries=2):
+            if not self._pipeline.authorize_with_revoke(
+                    "knowledge_file", fid, t.name, t.gns, grants, timeout=60, retries=2):
                 raise RuntimeError(f"BISHENG authorization failed for file {fid}")
             logger.info(f"Synced new file: {t.name[:50]} -> BS id={fid} parent={parent_id}")
         except Exception as e:
