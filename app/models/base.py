@@ -26,7 +26,11 @@ if _db_type == "dameng":
             password=_db.get("password", "SYSDBA"),
             server=_db.get("host", "127.0.0.1"),
             port=_db.get("port", 5236),
-            local_code=1,      # UTF-8 (avoid GBK encoding errors)
+            local_code=1,      # UTF-8 (避免 GBK 编码错误)
+            # 无超时时网络丢包会导致连接无限期挂起（无异常无日志）；
+            # 显式设超时，连不上时快速失败而不是静默卡死。
+            login_timeout=_db.get("connect_timeout", 10),
+            connection_timeout=_db.get("connect_timeout", 10),
         )
 
     def _full_table(table_name: str) -> str:

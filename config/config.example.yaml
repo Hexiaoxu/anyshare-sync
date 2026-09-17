@@ -44,6 +44,7 @@ database:
   schema: "BISHENG_FOR_AISHU"
   pool_size: 5
   pool_timeout: 30
+  connect_timeout: 10   # 秒；网络不通时快速失败而不是无限期挂起
 
 # ── 同步配置 ───────────────────────────────────────────────────
 sync:

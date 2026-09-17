@@ -50,19 +50,35 @@ for i, a in enumerate(args):
 
 logger.info(f"增量同步守护进程启动 ({'单次模式' if once_mode else f'每{interval}秒'})")
 
-from app.connectors.anyshare.auth import AnyShareAuth
-from app.connectors.bisheng.token_generator import generate_bs_token
-from app.sync_pipeline import SyncPipeline
-from app.services.log_scheduler import LogSyncScheduler
+try:
+    logger.info("[启动] 导入依赖模块...")
+    from app.connectors.anyshare.auth import AnyShareAuth
+    from app.connectors.bisheng.token_generator import generate_bs_token
+    from app.sync_pipeline import SyncPipeline
+    from app.services.log_scheduler import LogSyncScheduler
+    logger.info("[启动] 模块导入完成")
 
-auth = AnyShareAuth(AS_BASE, AS_APP_ID, AS_SECRET)
-console_token = auth.get_user_token(ADMIN_ACCOUNT)
-bs_cookie = generate_bs_token()
+    logger.info(f"[启动] 正在获取 AnyShare 用户 token (account={ADMIN_ACCOUNT}, base={AS_BASE})...")
+    auth = AnyShareAuth(AS_BASE, AS_APP_ID, AS_SECRET)
+    console_token = auth.get_user_token(ADMIN_ACCOUNT)
+    logger.info("[启动] AnyShare 用户 token 获取成功")
 
-pipeline = SyncPipeline(BS_BASE, bs_cookie, AS_BASE, console_token,
-                        as_auth=auth, as_account=ADMIN_ACCOUNT)
-pipeline.restore_state()
-scheduler = LogSyncScheduler(pipeline, console_token, bs_cookie, interval=interval)
+    logger.info("[启动] 正在生成 BISHENG cookie...")
+    bs_cookie = generate_bs_token()
+    logger.info("[启动] BISHENG cookie 生成成功")
+
+    logger.info(f"[启动] 正在初始化同步 pipeline (bs_base={BS_BASE})...")
+    pipeline = SyncPipeline(BS_BASE, bs_cookie, AS_BASE, console_token,
+                            as_auth=auth, as_account=ADMIN_ACCOUNT)
+    logger.info("[启动] pipeline 初始化完成，正在恢复状态（连接数据库）...")
+    pipeline.restore_state()
+    logger.info("[启动] 状态恢复完成")
+
+    scheduler = LogSyncScheduler(pipeline, console_token, bs_cookie, interval=interval)
+    logger.info("[启动] 调度器已创建，准备进入主循环")
+except Exception:
+    logger.exception("[启动] 守护进程初始化失败")
+    raise
 
 if once_mode:
     result = scheduler.run_once()
