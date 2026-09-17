@@ -1,8 +1,12 @@
 """Database engine — SQLite (dev) or Dameng (prod), configured via config.yaml."""
 
+import logging
 import os
+import time
 from pathlib import Path
 import yaml
+
+logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "config.yaml"
 
@@ -21,17 +25,54 @@ if _db_type == "dameng":
     engine = None  # not used — we use raw dmPython
 
     def _get_dm_conn():
-        return dmPython.connect(
-            user=_db.get("user", "SYSDBA"),
-            password=_db.get("password", "SYSDBA"),
-            server=_db.get("host", "127.0.0.1"),
-            port=_db.get("port", 5236),
-            local_code=1,      # UTF-8 (避免 GBK 编码错误)
-            # 无超时时网络丢包会导致连接无限期挂起（无异常无日志）；
-            # 显式设超时，连不上时快速失败而不是静默卡死。
-            login_timeout=_db.get("connect_timeout", 10),
-            connection_timeout=_db.get("connect_timeout", 10),
-        )
+        """Connect to Dameng.
+
+        dmPython's own login_timeout/connection_timeout have been observed to
+        NOT actually bound how long connect() can block — under packet loss
+        it hangs forever with no exception and no log line, which looks like
+        the whole process silently died. We can't fix the driver, but we can
+        force our own hard ceiling around the call: on Linux (the only
+        target here — this only runs inside the Docker image), SIGALRM
+        interrupts connect() even if the driver itself never times out, so a
+        stuck connection becomes a loud, logged TimeoutError instead of an
+        indistinguishable hang.
+        """
+        timeout_s = int(_db.get("connect_timeout", 10))
+        host, port = _db.get("host", "127.0.0.1"), _db.get("port", 5236)
+        logger.info(f"[dameng] connecting to {host}:{port} (timeout={timeout_s}s) ...")
+        t0 = time.monotonic()
+
+        import signal
+        has_alarm = hasattr(signal, "SIGALRM")
+        if has_alarm:
+            def _on_alarm(signum, frame):
+                raise TimeoutError(
+                    f"dmPython.connect() to {host}:{port} did not return within "
+                    f"{timeout_s + 5}s (driver's own login_timeout/"
+                    f"connection_timeout did not bound it) — check network "
+                    f"reachability / firewall to the Dameng host, not just "
+                    f"that the port answers a plain TCP connect.")
+            old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.alarm(timeout_s + 5)  # small margin over the driver's own timeout
+
+        try:
+            conn = dmPython.connect(
+                user=_db.get("user", "SYSDBA"),
+                password=_db.get("password", "SYSDBA"),
+                server=host,
+                port=port,
+                local_code=1,      # UTF-8 (避免 GBK 编码错误)
+                # 无超时时网络丢包会导致连接无限期挂起（无异常无日志）；
+                # 显式设超时，连不上时快速失败而不是静默卡死。
+                login_timeout=timeout_s,
+                connection_timeout=timeout_s,
+            )
+            logger.info(f"[dameng] connected in {time.monotonic() - t0:.1f}s")
+            return conn
+        finally:
+            if has_alarm:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
 
     def _full_table(table_name: str) -> str:
         s = _db.get("schema", "")
