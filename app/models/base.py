@@ -67,7 +67,14 @@ if _db_type == "dameng":
             conn = dmPython.connect(
                 user=_db.get("user", "SYSDBA"),
                 password=_db.get("password", "SYSDBA"),
-                server=host,
+                # host=, not server= — BISHENG's own (working) dmSQLAlchemy
+                # connection layer uses host=/port=/dsn=, never server=. The
+                # driver's compiled string table shows host and server are
+                # two distinct, mutually-exclusive code paths internally
+                # ("host or server can only set one" / "invalid server") —
+                # server= is the less-exercised one and the prime suspect
+                # for the SIGFPE crash we hit that BISHENG never sees.
+                host=host,
                 port=port,
                 local_code=1,      # UTF-8 (避免 GBK 编码错误)
                 # 无超时时网络丢包会导致连接无限期挂起（无异常无日志）；
