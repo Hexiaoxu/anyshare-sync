@@ -36,8 +36,16 @@ if _db_type == "dameng":
         interrupts connect() even if the driver itself never times out, so a
         stuck connection becomes a loud, logged TimeoutError instead of an
         indistinguishable hang.
+
+        Default floor is 30s, not the old 10s: BISHENG's own Dameng connection
+        layer (core/database/connection.py) hit the same class of failure —
+        their dmAsync default (login_timeout=5s) occasionally wasn't enough
+        for the DM login handshake under load, aborting with
+        "[CODE:-70028]Create SOCKET connection failure" on ~4% of connects.
+        Raising both timeouts to 30s eliminated it in their production. This
+        is config.yaml's database.connect_timeout, so still overridable.
         """
-        timeout_s = int(_db.get("connect_timeout", 10))
+        timeout_s = int(_db.get("connect_timeout", 30))
         host, port = _db.get("host", "127.0.0.1"), _db.get("port", 5236)
         logger.info(f"[dameng] connecting to {host}:{port} (timeout={timeout_s}s) ...")
         t0 = time.monotonic()

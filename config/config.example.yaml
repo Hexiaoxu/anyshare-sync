@@ -44,7 +44,10 @@ database:
   schema: "BISHENG_FOR_AISHU"
   pool_size: 5
   pool_timeout: 30
-  connect_timeout: 10   # 秒；网络不通时快速失败而不是无限期挂起
+  connect_timeout: 30   # 秒；BISHENG 自己连达梦也踩过同样的坑——握手偶尔超过
+                        # 5~10s（不是网络不通，只是慢），10s 太短会被驱动当成
+                        # 连接失败误判；BISHENG 生产环境把这个提到 30s 后此类
+                        # 问题归零，这里沿用同样的值
 
 # ── 同步配置 ───────────────────────────────────────────────────
 sync:
