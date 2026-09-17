@@ -8,6 +8,8 @@ from functools import lru_cache
 from dataclasses import dataclass, field
 import yaml
 
+from app import ssl_bypass  # noqa: F401 — side effect: disables httpx TLS verification
+
 _CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.yaml"
 
 
