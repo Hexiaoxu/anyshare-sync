@@ -214,12 +214,25 @@ class SyncPipeline:
             source_type: str = "knowledge_doc_lib",
             incremental: bool = False,
             grant_owner: str | None = None,
-            no_root_perms: bool = False) -> dict:
-        """Run full sync pipeline. Returns summary dict.
+            no_root_perms: bool = False,
+            force_recreate: bool = False) -> dict:
+        """Run sync pipeline for one AnyShare doc lib -> BISHENG space. Returns summary dict.
+
+        Safe by default: reuses an existing target space and its known
+        folders/files (via restore_state()) and skips re-transferring files
+        whose source_rev hasn't changed. Re-running this — whether
+        incremental=True or False — never deletes existing BISHENG data.
 
         Args:
-            incremental: If True, reuse existing space and only sync
-                         new/changed files. Skips cleanup.
+            incremental: Caller/log intent only. Both True and False use the
+                         same safe reuse-and-diff behavior; kept for callers
+                         that distinguish "first full pass" from "rerun" in
+                         logs/orchestration.
+            force_recreate: If True, restores the old destructive behavior —
+                         deletes any existing space with this name and
+                         rebuilds everything from scratch (every file
+                         re-downloaded/re-uploaded). Only use when a clean
+                         rebuild is genuinely wanted.
             grant_owner: BISHENG username (external_id or display name)
                          to grant as additional owner of the space.
                          Used for personal lib migrations.
@@ -229,17 +242,15 @@ class SyncPipeline:
         set_trace_id(trace_id)
         start_time = datetime.datetime.now()
 
-        logger.info(f"=== Sync start: {space_name} ({source_type}) "
-                     f"{'incremental' if incremental else 'full'} ===")
+        mode = "force-recreate" if force_recreate else (
+            "incremental" if incremental else "full (safe reuse)")
+        logger.info(f"=== Sync start: {space_name} ({source_type}) {mode} ===")
 
         try:
-            # 0. Space setup
-            if incremental:
-                self._space_id = self._find_or_create_space(space_name)
-                self.restore_state()
-            else:
+            # 0. Space setup — safe by default: reuse, never delete existing data.
+            if force_recreate:
                 # A TreeOrchestrator reuses one pipeline across spaces. Never
-                # leak mappings from the previous full-sync space.
+                # leak mappings from the previous space.
                 self._folder_map = {}
                 self._file_map = {}
                 self._uuid_to_gns = {}
@@ -248,6 +259,9 @@ class SyncPipeline:
                 self._cleanup_old(space_name)
                 self._space_id = self._bs_space.create_personal(
                     space_name, "AnyShare文档迁移")
+            else:
+                self._space_id = self._find_or_create_space(space_name)
+                self.restore_state()
 
             self._mapper.set_api_context(self._bs_perm, self._space_id)
             logger.info(f"Space: id={self._space_id}")
@@ -283,25 +297,27 @@ class SyncPipeline:
             logger.info(f"Scan: {len(all_dirs)} dirs, {len(all_files)} files"
                         + (f", {skipped} skipped" if skipped else ""))
 
-            # 3. Create folder structure
+            # 3. Create folder structure — reuse existing BISHENG folders by
+            # name unless force_recreate (avoids duplicate folders on rerun).
             self._create_folders(all_dirs, lib_gns, ancestor_parent,
-                                 incremental=incremental)
+                                 incremental=not force_recreate)
             logger.info(f"Folders: {len(self._folder_map)} created")
 
-            # 4. Transfer files (incremental: skip existing)
+            # 4. Transfer files — skip unchanged (by source_rev) unless
+            # force_recreate, so reruns don't re-download/re-upload everything.
             transfer_files = all_files
             skipped_existing = 0
-            if incremental:
+            if not force_recreate:
                 transfer_files, skipped_existing = self._filter_new_files(
                     all_files, lib_gns)
-                logger.info(f"Incremental: {skipped_existing} unchanged, "
+                logger.info(f"{skipped_existing} unchanged, "
                             f"{len(transfer_files)} new/changed to transfer")
 
             ok, ng = 0, 0
             if not skip_download and transfer_files:
                 ok, ng = self._transfer_files(
                     transfer_files, lib_gns, ancestor_parent,
-                    preserve_existing=incremental)
+                    preserve_existing=not force_recreate)
                 logger.info(f"Transfer: {ok}/{len(transfer_files)} OK, {ng} failed")
 
             # 5. Write mapping tables

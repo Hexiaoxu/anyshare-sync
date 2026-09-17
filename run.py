@@ -12,7 +12,8 @@ Usage:
     python run.py --sync-personal <user>        # Migrate one user's personal lib
     python run.py --sync-dept <name> <gns>      # Migrate one dept lib (folders+perms only)
     python run.py --sync-dept <name> <gns> --with-files  # Also migrate files
-    python run.py <gns> <space_name>            # Single scope full sync
+    python run.py <gns> <space_name>            # Single scope sync (safe to rerun, never deletes existing data)
+    python run.py <gns> <space_name> --force-recreate  # DESTRUCTIVE: deletes the space and rebuilds from scratch
 """
 import sys, os, logging, time
 from pathlib import Path
@@ -514,6 +515,7 @@ source_type = "knowledge_doc_lib"
 ancestors = None
 skip_download = "--skip-download" in args
 no_root_perms = "--no-root-perms" in args
+force_recreate = "--force-recreate" in args  # DESTRUCTIVE: deletes+rebuilds the space
 grant_owner = None
 for i, a in enumerate(args):
     if a == "--type" and i+1 < len(args): source_type = args[i+1]
@@ -526,7 +528,7 @@ pipeline = SyncPipeline(BS_BASE, "", AS_BASE, get_as_token(),
 result = pipeline.run(gns, space, ancestors=ancestors,
                       skip_download=skip_download, source_type=source_type,
                       incremental=incremental, grant_owner=grant_owner,
-                      no_root_perms=no_root_perms)
+                      no_root_perms=no_root_perms, force_recreate=force_recreate)
 print(f"\n=== Result ===")
 for k, v in result.items(): print(f"  {k}: {v}")
 if result.get("space_id"):
