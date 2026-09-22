@@ -230,7 +230,10 @@ class BishengPermission:
             f"/api/v1/permissions/resources/knowledge_space/{space_id}/grant-subjects/users",
             params={"keyword": keyword, "page": 1, "page_size": page_size},
         )
-        return self._c.ok(resp).get("data", [])
+        # Response payload is {"data": rows, "total": N} nested under ok()'s
+        # own "data" envelope — a plain .get("data", []) here would return
+        # that wrapper dict instead of the rows list.
+        return self._c.ok(resp).get("data", {}).get("data", [])
 
     def search_grant_departments(self, space_id: int, keyword: str, limit: int = 10) -> list[dict]:
         """Search BISHENG departments available for permission grants."""
