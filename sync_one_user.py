@@ -18,6 +18,10 @@ from app.config import cfg
 AS_B = cfg.as_base
 BS_B = cfg.bs_base
 
+from app.connectors.bisheng.client import BishengClient
+from app.connectors.bisheng.permission import BishengPermission
+bs_perm = BishengPermission(BishengClient(BS_B, BS))
+
 # 1. 复用已有空间，或创建新空间
 print(f"\n=== Preparing space: {USER_NAME} ===")
 with httpx.Client(timeout=30) as c:
@@ -54,9 +58,7 @@ try:
     if not owner_uid and r_u.json().get("data"):
         owner_uid = r_u.json()["data"][0].get("user_id")
     if owner_uid:
-        httpx.post(f"{BS_B}/api/v1/permissions/resources/knowledge_space/{SP}/authorize",
-            json={"grants": [{"subject_type": "user", "subject_id": owner_uid, "relation": "manager"}], "revokes": []},
-            cookies={"access_token_cookie": BS}, timeout=15)
+        bs_perm.add_grant("knowledge_space", SP, "user", owner_uid, "manager", timeout=15, retries=2)
         print(f"  Granted manager to {USER_NAME} (user_id={owner_uid})")
     else:
         print(f"  [WARN] User {USER_NAME} not found in BISHENG, skipping grant")
@@ -387,26 +389,13 @@ for name, any_gns, bs_id, res_type in acl_items:
         continue
 
     try:
-        # authorize can be slow (OpenFGA writes), retry with 60s timeout
-        for attempt in range(3):
-            try:
-                r = httpx.post(
-                    f"{BS_B}/api/v1/permissions/resources/{res_type}/{bs_id}/authorize",
-                    json={"grants": grants, "revokes": []},
-                    cookies={"access_token_cookie": BS},
-                    timeout=60)
-                break
-            except httpx.TimeoutException:
-                if attempt < 2:
-                    print(f"  retry {attempt+1}...", end=" ", flush=True)
-                    time.sleep(3)
-                else:
-                    raise
-        if r.status_code == 200:
+        # sync_grants can be slow (OpenFGA writes), retry with 60s timeout
+        ok = bs_perm.sync_grants(res_type, bs_id, grants, timeout=60, retries=2)
+        if ok:
             synced_count += 1
             print(f"  {res_type} {name[:35]}: {len(grants)} grants OK")
         else:
-            print(f"  {res_type} {name[:35]}: FAIL({r.status_code}) {r.text[:100]}")
+            print(f"  {res_type} {name[:35]}: FAIL")
     except Exception as e:
         print(f"  ACL ERR {name[:30]}: {str(e)[:80]}")
 

@@ -248,7 +248,7 @@ class TransferCoordinator:
                 entries, "knowledge_space", space_id,
             )
 
-            # Batch write FGA tuples — group by resource (object_type + object_id)
+            # Reconcile grants per resource (object_type + object_id)
             grants_by_resource: dict[tuple[str, int], list[dict]] = {}
             for tup in result.tuples:
                 key = (tup.object_type, tup.object_id)
@@ -261,11 +261,11 @@ class TransferCoordinator:
 
             synced = 0
             for (res_type, res_id), grants in grants_by_resource.items():
-                ok = self._bs_perm.authorize(res_type, res_id, grants=grants, timeout=60, retries=2)
+                ok = self._bs_perm.sync_grants(res_type, res_id, grants, timeout=60, retries=2)
                 if ok:
                     synced += len(grants)
                 else:
-                    logger.warning(f"Batch grant failed for {res_type}/{res_id}: {len(grants)} grants")
+                    logger.warning(f"Grant sync failed for {res_type}/{res_id}: {len(grants)} grants")
 
             # Snapshot
             snap = SyncPermissionSnapshot(

@@ -270,10 +270,9 @@ class SyncPipeline:
             if grant_owner:
                 target_uid = self._mapper.resolve_principal(grant_owner, "user")
                 if target_uid:
-                    self._bs_perm.authorize(
+                    self._bs_perm.add_grant(
                         "knowledge_space", self._space_id,
-                        grants=[{"subject_type": "user", "subject_id": target_uid,
-                                 "relation": "owner"}],
+                        "user", target_uid, "owner",
                         timeout=60, retries=2)
                     logger.info(f"Granted owner: {grant_owner} -> uid={target_uid}")
                 else:
@@ -457,12 +456,11 @@ class SyncPipeline:
                 if r.status_code != 200:
                     continue
                 grants = self._build_grants(r.json().get("perminfos", []))
-                if grants:
-                    ok = self._bs_perm.authorize(res_type, bs_id, grants=grants,
-                                                 timeout=60, retries=2)
-                    if ok:
-                        synced += 1
-                        logger.debug(f"  incr sync: {res_type} {name[:40]} OK")
+                ok = self.authorize_with_revoke(res_type, bs_id, name, gns, grants,
+                                                timeout=60, retries=2)
+                if ok:
+                    synced += 1
+                    logger.debug(f"  incr sync: {res_type} {name[:40]} OK")
             except Exception as e:
                 logger.warning(f"  incr sync failed: {obj_id} — {e}")
 
@@ -1127,62 +1125,23 @@ class SyncPipeline:
 
     # ── Permission revocation ────────────────────────────────
     #
-    # BISHENG's authorize() API accepts both grants and revokes in one call,
-    # but the ACL we get from AnyShare only ever tells us the CURRENT allowed
-    # set — never what was removed. So a user/department dropped from an
-    # AnyShare ACL would otherwise keep stale access in BISHENG forever.
-    # We diff against the grants we last applied (stored in
-    # SyncPermissionSnapshot, upserted per resource) to compute what to
-    # revoke this round.
+    # BISHENG's F048 Grant API has no batch grants+revokes call — sync_grants()
+    # reads the resource's live LOCAL grants and diffs them against `grants`
+    # itself, so a user/department dropped from an AnyShare ACL gets revoked
+    # in BISHENG even though AnyShare only ever tells us the CURRENT allowed
+    # set. Safe to call with an empty `grants` list (full revocation).
 
     def authorize_with_revoke(self, res_type: str, bs_id: int, name: str,
                               gns: str, grants: list[dict],
                               timeout: float = 60, retries: int = 2) -> bool:
-        """authorize() wrapper that also revokes anything granted last time
-        but missing from `grants` now, then updates the snapshot used for
-        the next diff. Safe to call with an empty `grants` list (full
-        revocation)."""
-        old_grants = self._load_previous_grants(res_type, bs_id)
-        revokes = self._diff_revokes(old_grants, grants)
-        if not grants and not revokes:
-            return True  # nothing to do, and nothing was ever granted
-        ok = self._bs_perm.authorize(res_type, bs_id, grants=grants,
-                                     revokes=revokes, timeout=timeout,
-                                     retries=retries)
+        """sync_grants() wrapper that also records the applied grants in
+        SyncPermissionSnapshot for audit."""
+        ok = self._bs_perm.sync_grants(res_type, bs_id, grants,
+                                       timeout=timeout, retries=retries)
         if ok:
-            if revokes:
-                logger.info(f"  {res_type} {name[:35]}: {len(grants)} grants, "
-                            f"{len(revokes)} revoked")
-            else:
-                logger.debug(f"  {res_type} {name[:35]}: {len(grants)} grants OK")
+            logger.debug(f"  {res_type} {name[:35]}: {len(grants)} grants OK")
             self._save_perm_snapshot(res_type, bs_id, name, gns, grants)
         return ok
-
-    @staticmethod
-    def _diff_revokes(old_grants: list[dict], new_grants: list[dict]) -> list[dict]:
-        """Grants present in `old_grants` but not `new_grants` (by subject+relation)."""
-        new_keys = {(g.get("subject_type"), g.get("subject_id"), g.get("relation"))
-                    for g in new_grants}
-        return [{"subject_type": g["subject_type"], "subject_id": g["subject_id"],
-                 "relation": g["relation"]}
-                for g in old_grants
-                if (g.get("subject_type"), g.get("subject_id"), g.get("relation"))
-                not in new_keys]
-
-    def _load_previous_grants(self, res_type: str, bs_id: int) -> list[dict]:
-        """Grants applied last time we wrote this resource's snapshot."""
-        try:
-            from app.models.permission_snapshot import SyncPermissionSnapshot
-            import json
-            resource_id = f"{res_type}/{bs_id}"
-            with get_session() as s:
-                snap = s.exec(select(SyncPermissionSnapshot).where(
-                    SyncPermissionSnapshot.resource_id == resource_id)).first()
-                if snap and snap.target_fga_tuples:
-                    return json.loads(snap.target_fga_tuples)
-        except Exception as e:
-            logger.debug(f"Snapshot read failed: {e}")
-        return []
 
     def _save_perm_snapshot(self, res_type: str, bs_id: int,
                             name: str, gns: str, grants: list):

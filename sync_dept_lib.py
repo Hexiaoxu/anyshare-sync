@@ -45,6 +45,10 @@ AS_TOKEN = auth.get_user_token(AS_ACCOUNT)
 as_headers = {'Authorization': f'Bearer {AS_TOKEN}'}
 bs_cookies = {'access_token_cookie': BROWSER_TOKEN}
 
+from app.connectors.bisheng.client import BishengClient
+from app.connectors.bisheng.permission import BishengPermission
+bs_perm = BishengPermission(BishengClient(BS_BASE, BROWSER_TOKEN))
+
 # 瞬态网络错误重试（AnyShare 偶发 "peer closed connection without sending complete
 # message body (incomplete chunked read)"，属网络抖动，重试即可）
 _RETRYABLE = (httpx.RemoteProtocolError, httpx.ConnectError,
@@ -444,15 +448,11 @@ for name, any_gns, bs_id, res_type in acl_items:
 
     if not grants: continue
     try:
-        r = httpx.post(
-            f'{BS_BASE}/api/v1/permissions/resources/{res_type}/{bs_id}/authorize',
-            json={'grants': grants, 'revokes': []},
-            cookies=bs_cookies, timeout=60)
-        sc = r.json().get('status_code')
-        if sc == 200:
+        ok = bs_perm.sync_grants(res_type, bs_id, grants, timeout=60, retries=2)
+        if ok:
             synced += 1
-        elif not _debug_shown or synced == 0:
-            print(f'  [debug] authorize fail: {sc} {r.json().get("status_message","")[:60]}', flush=True)
+        else:
+            print(f'  [debug] authorize fail: {res_type}/{bs_id}', flush=True)
     except Exception as e:
         print(f'  [debug] authorize err: {e}', flush=True)
 

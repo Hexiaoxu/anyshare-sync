@@ -50,47 +50,37 @@ def _pipeline():
     return p
 
 
-# ── _diff_revokes ────────────────────────────────────────────
-
-def test_diff_revokes_finds_removed_grants():
-    old = [{"subject_type": "user", "subject_id": 1, "relation": "viewer"},
-           {"subject_type": "user", "subject_id": 2, "relation": "viewer"}]
-    new = [{"subject_type": "user", "subject_id": 1, "relation": "viewer"}]
-    revokes = SyncPipeline._diff_revokes(old, new)
-    assert revokes == [{"subject_type": "user", "subject_id": 2, "relation": "viewer"}]
-
-
-def test_diff_revokes_empty_when_unchanged():
-    grants = [{"subject_type": "user", "subject_id": 1, "relation": "viewer"}]
-    assert SyncPipeline._diff_revokes(grants, grants) == []
-
-
 # ── authorize_with_revoke ────────────────────────────────────
+#
+# Revoke diffing now happens inside BishengPermission.sync_grants() itself
+# (it reads BISHENG's live LOCAL grants and diffs against `desired`), since
+# the F048 grants:mutate API needs a live assignee_id/assignee_version to
+# remove a grant — a local snapshot diff can no longer supply that. So
+# authorize_with_revoke is just a sync_grants() call plus an audit snapshot.
 
-def test_authorize_with_revoke_propagates_full_revocation():
-    """Access fully removed in AnyShare (grants=[]) must still revoke in BISHENG,
-    not silently no-op like the old `if grants and ...` guard did."""
+def test_authorize_with_revoke_calls_sync_grants_and_saves_snapshot():
+    """Access fully removed in AnyShare (grants=[]) must still be passed
+    through to sync_grants() so BISHENG revokes it, not silently no-op."""
     p = _pipeline()
-    p._bs_perm.authorize.return_value = True
-    with patch.object(p, "_load_previous_grants", return_value=[
-            {"subject_type": "user", "subject_id": 5, "relation": "viewer"}]), \
-         patch.object(p, "_save_perm_snapshot") as save:
+    p._bs_perm.sync_grants.return_value = True
+    with patch.object(p, "_save_perm_snapshot") as save:
         ok = p.authorize_with_revoke("knowledge_file", 42, "f.docx", "gns://X", [])
 
     assert ok is True
-    p._bs_perm.authorize.assert_called_once_with(
-        "knowledge_file", 42, grants=[],
-        revokes=[{"subject_type": "user", "subject_id": 5, "relation": "viewer"}],
-        timeout=60, retries=2)
+    p._bs_perm.sync_grants.assert_called_once_with(
+        "knowledge_file", 42, [], timeout=60, retries=2)
     save.assert_called_once()
 
 
-def test_authorize_with_revoke_noop_when_nothing_granted_or_revoked():
+def test_authorize_with_revoke_skips_snapshot_on_failure():
     p = _pipeline()
-    with patch.object(p, "_load_previous_grants", return_value=[]):
-        ok = p.authorize_with_revoke("knowledge_file", 42, "f.docx", "gns://X", [])
-    assert ok is True
-    p._bs_perm.authorize.assert_not_called()
+    p._bs_perm.sync_grants.return_value = False
+    with patch.object(p, "_save_perm_snapshot") as save:
+        ok = p.authorize_with_revoke(
+            "knowledge_file", 42, "f.docx", "gns://X",
+            [{"subject_type": "user", "subject_id": 5, "relation": "viewer"}])
+    assert ok is False
+    save.assert_not_called()
 
 
 # ── _detect_and_delete_missing ───────────────────────────────
